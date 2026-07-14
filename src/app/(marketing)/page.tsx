@@ -1,8 +1,9 @@
 'use client';
 
-import { useState, useEffect, useRef } from 'react';
+import { useState, useEffect, useLayoutEffect, useRef } from 'react';
 import { createPortal } from 'react-dom';
 import * as XLSX from 'xlsx';
+import QRCode from 'qrcode';
 import { LocalStore, today, specOf } from '@/lib/gate-pass-store';
 import type { DeliveryNote, DNLine, GatePass, Customer, PlantMaster, LocationMaster, UserAccount, NumberSettings } from '@/lib/gate-pass-store';
 
@@ -32,6 +33,25 @@ const C = {
 // ── Logo ──────────────────────────────────────────────────────────────────────
 function Logo({ style }: { style?: React.CSSProperties }) {
   return <img src="/acacia-logo.png" alt="Acacia" style={{ objectFit: 'contain', ...style }} />;
+}
+
+// ── QR Code ───────────────────────────────────────────────────────────────────
+// Drawn in useLayoutEffect (not a dynamic import) so the canvas has real
+// pixels as soon as possible after mount — PDF export clones this element
+// shortly after, and a still-pending draw would clone a blank canvas (see
+// copyCanvasBitmaps in buildDeliveryNotePdf).
+function QrCode({ value, size = 60, color = '#9aa39d' }: { value: string; size?: number; color?: string }) {
+  const canvasRef = useRef<HTMLCanvasElement>(null);
+  useLayoutEffect(() => {
+    if (!canvasRef.current || !value) return;
+    QRCode.toCanvas(canvasRef.current, value, {
+      width: size, margin: 0, color: { dark: color, light: '#0000' },
+    }).catch(() => {
+      // encoding failure — leave the canvas blank
+    });
+  }, [value, size, color]);
+  if (!value) return null;
+  return <canvas ref={canvasRef} style={{ display: 'block' }} />;
 }
 
 // ── Status chip ───────────────────────────────────────────────────────────────
@@ -611,8 +631,22 @@ async function buildDeliveryNotePdf(el: HTMLElement) {
   }
   if (chunks.length === 0) chunks.push([]);
 
+  // cloneNode(true) copies a <canvas> element but not its drawn pixels (the
+  // bitmap lives outside the DOM tree), so anything drawn on a canvas — like
+  // the barcode — comes out blank in the clone unless it's re-painted here.
+  const copyCanvasBitmaps = (source: HTMLElement, target: HTMLElement) => {
+    const sourceCanvases = source.querySelectorAll('canvas');
+    const targetCanvases = target.querySelectorAll('canvas');
+    sourceCanvases.forEach((sourceCanvas, i) => {
+      const targetCanvas = targetCanvases[i];
+      if (!targetCanvas) return;
+      targetCanvas.getContext('2d')?.drawImage(sourceCanvas, 0, 0);
+    });
+  };
+
   const makeCopy = (chunkRows: Element[]) => {
     const copy = el.cloneNode(true) as HTMLElement;
+    copyCanvasBitmaps(el, copy);
     const tbody = copy.querySelector('table tbody');
     if (tbody) {
       tbody.innerHTML = '';
@@ -1201,6 +1235,15 @@ export default function GatePassApp() {
       setResetPasswordUserId(null);
       setToast('Password reset');
       setView('admin_users');
+    } catch (e) { setToast((e as Error).message); }
+  };
+
+  const deleteUser = (u: UserAccount) => {
+    if (!window.confirm(`Delete user account "${u.username}"? This cannot be undone.`)) return;
+    try {
+      getStore().deleteUserAccount(u.id);
+      reload();
+      setToast('User account deleted');
     } catch (e) { setToast((e as Error).message); }
   };
 
@@ -2181,9 +2224,12 @@ export default function GatePassApp() {
                         <td style={{ padding: '13px 16px', fontSize: 13.5, color: '#46514a' }}>{u.createdBy}</td>
                         <td style={{ padding: '13px 16px', fontSize: 13.5, color: '#46514a' }}>{u.createdAt}</td>
                         <td style={{ padding: '13px 16px' }}><LastModified by={u.modifiedBy} at={u.modifiedAt} /></td>
-                        <td style={{ padding: '13px 16px', textAlign: 'right' }}>
+                        <td style={{ padding: '13px 16px', textAlign: 'right', whiteSpace: 'nowrap' }}>
                           <button onClick={() => openResetPassword(u)} style={{ background: 'none', border: 'none', color: C.primary, fontWeight: 700, fontSize: 13, cursor: 'pointer', fontFamily: 'inherit' }}>
                             Reset Password
+                          </button>
+                          <button onClick={() => deleteUser(u)} style={{ background: 'none', border: 'none', color: '#c46', fontWeight: 700, fontSize: 13, cursor: 'pointer', fontFamily: 'inherit', marginLeft: 14 }}>
+                            Delete
                           </button>
                         </td>
                       </tr>
@@ -2605,7 +2651,7 @@ export default function GatePassApp() {
               onSelectLine={setScanLineSlNo}
               onRemoveSerial={(slNo, code) => { removeSerial(scanDn.no, slNo, code); reload(); }}
               onComplete={completeDn}
-              onBack={() => setView('garden_scanning')}
+              onBack={() => setView(auth?.role === 'admin' ? 'admin_dns' : 'garden_scanning')}
             />
           )}
 
@@ -2963,7 +3009,10 @@ function ViewDeliveryNote({ dn, gp, role, scanned, target, onBack, onContinueSca
   const renderDnCopy = () => (
     <>
       <div style={{ textAlign: 'center', position: 'relative' }}>
-        <div style={{ position: 'absolute', right: 0, top: 0 }}><Logo style={{ width: 98, height: 78, color: '#123c2b' }} /></div>
+        <div style={{ position: 'absolute', right: 0, top: 0, display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 4 }}>
+          <Logo style={{ width: 98, height: 78, color: '#123c2b' }} />
+          <QrCode value={dn.no} size={44} color="#b9c2bc" />
+        </div>
         <div style={{ fontWeight: 800, fontSize: 22 }}>Acacia LLC</div>
         <h2 style={{ fontFamily: 'var(--font-spectral),serif', fontWeight: 700, fontSize: 24, margin: '10px 0 0', textDecoration: 'underline', textUnderlineOffset: 5 }}>Delivery Note</h2>
       </div>
@@ -3082,11 +3131,6 @@ function ViewDeliveryNote({ dn, gp, role, scanned, target, onBack, onContinueSca
       <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 14 }} data-print-hide>
         <button onClick={onBack} style={{ background: 'none', border: 'none', color: '#5b6660', fontWeight: 600, fontSize: 13.5, cursor: 'pointer', fontFamily: 'inherit' }}>← Back</button>
         <div style={{ display: 'flex', gap: 10 }}>
-          {isScanning && role === 'garden' && (
-            <Btn onClick={onContinueScan} style={{ background: '#fff', border: '1px solid #cfd8d2', color: C.primary, borderRadius: 9, padding: '10px 18px', fontSize: 14, fontWeight: 700, cursor: 'pointer' }}>
-              Continue Scanning →
-            </Btn>
-          )}
           <Btn onClick={() => handleDownloadPdf(dnPdfFilename)} disabled={downloading} style={{ background: '#fff', border: `1px solid ${C.primary}`, color: C.primary, borderRadius: 9, padding: '10px 18px', fontSize: 14, fontWeight: 700, cursor: downloading ? 'default' : 'pointer', opacity: downloading ? 0.6 : 1 }}>
             {downloading ? 'Preparing PDF…' : 'Download PDF'}
           </Btn>
@@ -3117,10 +3161,23 @@ function ViewDeliveryNote({ dn, gp, role, scanned, target, onBack, onContinueSca
         </div>
       </div>
 
-      {/* Printable DN — screen/print view is a single copy; PDF export paginates + duplicates it (see buildDeliveryNotePdf) */}
+      {/* Printable DN — screen view is a single copy. PDF export paginates + duplicates it
+          (see buildDeliveryNotePdf); the browser Print output gets the same upper+lower
+          duplicate via the .print-only block below, which is invisible on screen. */}
       <div ref={printRef} data-print-doc style={{ background: '#fff', border: '1px solid #e2e7e3', borderRadius: 10, maxWidth: 920, margin: '0 auto', padding: '34px 44px' }}>
         {renderDnCopy()}
+        <div className="print-only">
+          <div style={{ position: 'relative', borderTop: '1px dashed #9aa39d', margin: '24px 0 0', paddingTop: 14 }}>
+            <span style={{ position: 'absolute', left: '50%', top: -8, transform: 'translateX(-50%)', background: '#fff', padding: '0 10px', fontSize: 11, color: '#9aa39d', letterSpacing: '.04em' }}>✂ cut here</span>
+          </div>
+          {renderDnCopy()}
+        </div>
         <div data-print-hide style={{ display: 'flex', justifyContent: 'flex-end', gap: 10, marginTop: 24 }}>
+          {isScanning && (
+            <Btn onClick={onContinueScan} style={{ background: C.white, border: '1px solid #cfd8d2', color: C.primary, borderRadius: 9, padding: '10px 18px', fontSize: 14, fontWeight: 700, cursor: 'pointer' }}>
+              Scanner
+            </Btn>
+          )}
           <Btn onClick={() => exportDnScanSheet(dn)} style={{ background: C.white, border: `1px solid ${C.primary}`, color: C.primary, borderRadius: 9, padding: '10px 18px', fontSize: 14, fontWeight: 700, cursor: 'pointer' }}>
             QR Code
           </Btn>

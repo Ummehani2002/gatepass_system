@@ -679,4 +679,17 @@ export class LocalStore {
     this.write({ ...data, users: data.users.map(u => u.id === id ? updated : u) });
     return updated;
   }
+
+  deleteUserAccount(id: string): void {
+    const data = this.read();
+    const existing = data.users.find(u => u.id === id);
+    if (!existing) throw new Error('User not found');
+    if (existing.role === 'admin' && data.users.filter(u => u.role === 'admin').length <= 1) {
+      throw new Error('Cannot delete the last remaining Admin account');
+    }
+    if (this.auth?.name === existing.username) {
+      throw new Error('Cannot delete the account you are currently signed in with');
+    }
+    this.write({ ...data, users: data.users.filter(u => u.id !== id) });
+  }
 }

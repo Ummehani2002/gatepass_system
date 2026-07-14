@@ -24,12 +24,19 @@ input::placeholder { color: #a7b0aa; }
   margin: 10mm;
 }
 
+/* Hidden on screen, shown only in the browser's print output — used for the
+   second (lower-half) copy of the Delivery Note so printing produces the same
+   upper+lower duplicate layout as the PDF export, without showing two copies
+   on screen. */
+.print-only { display: none; }
+
 @media print {
   [data-print-hide] { display: none !important; }
   [data-print-doc]  { box-shadow: none !important; border: none !important; margin: 0 !important; }
   [data-print-doc] input { border: none !important; padding: 0 !important; background: transparent !important; }
   [data-app-bg]     { background: #fff !important; }
   body              { background: #fff !important; }
+  .print-only       { display: block !important; }
 }
 
 /* ── Responsive shell (mobile / narrow-screen layout) ──────────────────────
