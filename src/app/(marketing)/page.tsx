@@ -1,15 +1,16 @@
 'use client';
 
-import { useState, useEffect, useRef } from 'react';
+import { useState, useEffect, useLayoutEffect, useRef } from 'react';
 import { createPortal } from 'react-dom';
 import * as XLSX from 'xlsx';
-import { LocalStore, today, specOf } from '@/lib/gate-pass-store';
-import type { DeliveryNote, DNLine, GatePass, Customer, PlantMaster, LocationMaster, UserAccount, NumberSettings } from '@/lib/gate-pass-store';
+import QRCode from 'qrcode';
+import { createStore, today, specOf } from '@/lib/gate-pass-store';
+import type { DeliveryNote, DNLine, GatePass, Customer, PlantMaster, LocationMaster, UserAccount, NumberSettings, DataStore } from '@/lib/gate-pass-store';
 
 // ── Store singleton ───────────────────────────────────────────────────────────
-let _store: LocalStore | null = null;
+let _store: DataStore | null = null;
 function getStore() {
-  if (!_store) _store = new LocalStore();
+  if (!_store) _store = createStore();
   return _store;
 }
 
@@ -32,6 +33,25 @@ const C = {
 // ── Logo ──────────────────────────────────────────────────────────────────────
 function Logo({ style }: { style?: React.CSSProperties }) {
   return <img src="/acacia-logo.png" alt="Acacia" style={{ objectFit: 'contain', ...style }} />;
+}
+
+// ── QR Code ───────────────────────────────────────────────────────────────────
+// Drawn in useLayoutEffect (not a dynamic import) so the canvas has real
+// pixels as soon as possible after mount — PDF export clones this element
+// shortly after, and a still-pending draw would clone a blank canvas (see
+// copyCanvasBitmaps in buildDeliveryNotePdf).
+function QrCode({ value, size = 60, color = '#9aa39d' }: { value: string; size?: number; color?: string }) {
+  const canvasRef = useRef<HTMLCanvasElement>(null);
+  useLayoutEffect(() => {
+    if (!canvasRef.current || !value) return;
+    QRCode.toCanvas(canvasRef.current, value, {
+      width: size, margin: 0, color: { dark: color, light: '#0000' },
+    }).catch(() => {
+      // encoding failure — leave the canvas blank
+    });
+  }, [value, size, color]);
+  if (!value) return null;
+  return <canvas ref={canvasRef} style={{ display: 'block' }} />;
 }
 
 // ── Status chip ───────────────────────────────────────────────────────────────
@@ -611,8 +631,22 @@ async function buildDeliveryNotePdf(el: HTMLElement) {
   }
   if (chunks.length === 0) chunks.push([]);
 
+  // cloneNode(true) copies a <canvas> element but not its drawn pixels (the
+  // bitmap lives outside the DOM tree), so anything drawn on a canvas — like
+  // the barcode — comes out blank in the clone unless it's re-painted here.
+  const copyCanvasBitmaps = (source: HTMLElement, target: HTMLElement) => {
+    const sourceCanvases = source.querySelectorAll('canvas');
+    const targetCanvases = target.querySelectorAll('canvas');
+    sourceCanvases.forEach((sourceCanvas, i) => {
+      const targetCanvas = targetCanvases[i];
+      if (!targetCanvas) return;
+      targetCanvas.getContext('2d')?.drawImage(sourceCanvas, 0, 0);
+    });
+  };
+
   const makeCopy = (chunkRows: Element[]) => {
     const copy = el.cloneNode(true) as HTMLElement;
+    copyCanvasBitmaps(el, copy);
     const tbody = copy.querySelector('table tbody');
     if (tbody) {
       tbody.innerHTML = '';
@@ -864,8 +898,8 @@ export default function GatePassApp() {
   }, [toast]);
 
   // ── Data helpers ──
-  const reload = () => {
-    const d = getStore().loadAll();
+  const reload = async () => {
+    const d = await getStore().loadAll();
     setGps(d.gps);
     setDns(d.dns);
     setCustomers(d.customers);
@@ -874,6 +908,29 @@ export default function GatePassApp() {
     setUsers(d.users);
     setNumberSettings(d.numberSettings);
   };
+
+  // Restore API/local session after refresh
+  useEffect(() => {
+    const store = getStore();
+    if (!store.auth) return;
+    setAuth(store.auth);
+    void (async () => {
+      try {
+        const d = await store.loadAll();
+        setGps(d.gps);
+        setDns(d.dns);
+        setCustomers(d.customers);
+        setPlants(d.plants);
+        setLocations(d.locations);
+        setUsers(d.users);
+        setNumberSettings(d.numberSettings);
+        setView(store.auth!.role === 'admin' ? 'admin_dashboard' : 'garden_home');
+      } catch {
+        await store.logout();
+        setAuth(null);
+      }
+    })();
+  }, []);
 
   const activeGp = gps.find(g => g.no === activeGpNo) || null;
   const activeDn = dns.find(d => d.no === activeDnNo) || null;
@@ -884,11 +941,11 @@ export default function GatePassApp() {
   const kSerials = dns.reduce((a, d) => a + d.lines.reduce((b, l) => b + l.serials.length, 0), 0);
 
   // ── Auth handlers ──
-  const signIn = () => {
+  const signIn = async () => {
     try {
-      const user = getStore().login(loginUser, loginPass);
+      const user = await getStore().login(loginUser, loginPass);
       setAuth(user);
-      reload();
+      await reload();
       setLoginErr('');
       setView(user.role === 'admin' ? 'admin_dashboard' : 'garden_home');
     } catch (e) {
@@ -896,8 +953,8 @@ export default function GatePassApp() {
     }
   };
 
-  const logout = () => {
-    getStore().logout();
+  const logout = async () => {
+    await getStore().logout();
     setAuth(null); setLoginRole(null);
     setLoginUser(''); setLoginPass(''); setLoginErr('');
     setView('login_roles');
@@ -965,27 +1022,27 @@ export default function GatePassApp() {
   const removeGpLine = (idx: number) =>
     setGpForm(f => ({ ...f, lines: f.lines.filter(l => l.idx !== idx) }));
 
-  const saveGp = () => {
+  const saveGp = async () => {
     if (!gpForm.customerName.trim()) { setToast('Customer name is required'); return; }
     const validLines = gpForm.lines.filter(l => l.plantDesc.trim() || l.plantCode.trim());
     if (!validLines.length) { setToast('At least one plant line is required'); return; }
     if (!gpForm.assignedTo.length) { setToast('Please assign at least one user before submitting'); return; }
     try {
       if (editingGpNo) {
-        getStore().updateGatePass(editingGpNo, { ...gpForm, lines: validLines });
+        await getStore().updateGatePass(editingGpNo, { ...gpForm, lines: validLines });
         setToast('Gate pass updated');
-        reload();
+        await reload();
         setEditingGpNo(null);
         setView('admin_gps');
       } else if (gpForGardenDn) {
-        const gp = getStore().createGatePass({ ...gpForm, lines: validLines });
-        reload();
+        const gp = await getStore().createGatePass({ ...gpForm, lines: validLines });
+        await reload();
         setGpForGardenDn(false);
         openNewDn(gp);
       } else {
-        getStore().createGatePass({ ...gpForm, lines: validLines });
+        await getStore().createGatePass({ ...gpForm, lines: validLines });
         setToast('Gate pass saved');
-        reload();
+        await reload();
         setEditingGpNo(null);
         setView('admin_gps');
       }
@@ -1014,15 +1071,15 @@ export default function GatePassApp() {
       ...f, lines: f.lines.map(l => l.slNo === slNo ? { ...l, [k]: v } : l),
     } : f);
 
-  const saveDn = (startScanning: boolean) => {
+  const saveDn = async (startScanning: boolean) => {
     if (!dnForm) return;
     if (!dnForm.vhNumber.trim()) { setToast('Vehicle number is required'); return; }
     try {
-      const dn = getStore().createDeliveryNote({
+      const dn = await getStore().createDeliveryNote({
         ...dnForm,
         lines: dnForm.lines.map(l => ({ slNo: l.slNo, deliveryQty: Number(l.deliveryQty) || 0, remarks: l.remarks, location: l.location })),
       });
-      reload();
+      await reload();
       setDnForm(null);
       if (startScanning) {
         setScanDnNo(dn.no);
@@ -1070,19 +1127,19 @@ export default function GatePassApp() {
   const removeCustomerProject = (idx: number) =>
     setCustomerForm(f => ({ ...f, projects: f.projects.filter(p => p.idx !== idx) }));
 
-  const saveCustomer = () => {
+  const saveCustomer = async () => {
     if (!customerForm.customerName.trim()) { setToast('Customer name is required'); return; }
     const validProjects = customerForm.projects.map(p => p.value.trim()).filter(Boolean);
     if (!validProjects.length) { setToast('At least one project is required'); return; }
     try {
       if (editingCustomerId) {
-        getStore().updateCustomer(editingCustomerId, { customerName: customerForm.customerName, party: customerForm.party, projects: validProjects });
+        await getStore().updateCustomer(editingCustomerId, { customerName: customerForm.customerName, party: customerForm.party, projects: validProjects });
         setToast('Customer updated');
       } else {
-        getStore().createCustomer({ customerName: customerForm.customerName, party: customerForm.party, projects: validProjects });
+        await getStore().createCustomer({ customerName: customerForm.customerName, party: customerForm.party, projects: validProjects });
         setToast('Customer saved');
       }
-      reload();
+      await reload();
       setEditingCustomerId(null);
       setView('admin_customers');
     } catch (e) { setToast((e as Error).message); }
@@ -1097,12 +1154,12 @@ export default function GatePassApp() {
   const updatePlantField = (k: keyof PlantForm, v: string) =>
     setPlantForm(f => ({ ...f, [k]: v }));
 
-  const savePlant = () => {
+  const savePlant = async () => {
     if (!plantForm.category.trim()) { setToast('Category is required'); return; }
     if (!plantForm.plantName.trim()) { setToast('Plant name is required'); return; }
     try {
-      getStore().createPlantMaster(plantForm);
-      reload();
+      await getStore().createPlantMaster(plantForm);
+      await reload();
       setToast('Plant saved');
       setView('admin_plants');
     } catch (e) { setToast((e as Error).message); }
@@ -1136,8 +1193,8 @@ export default function GatePassApp() {
         setToast('No valid rows found — expected "Category" and "Plant Name" columns');
         return;
       }
-      getStore().createPlantsBulk(parsed);
-      reload();
+      await getStore().createPlantsBulk(parsed);
+      await reload();
       setToast(`Imported ${parsed.length} plant${parsed.length === 1 ? '' : 's'}`);
     } catch {
       setToast('Could not read the Excel file');
@@ -1153,11 +1210,11 @@ export default function GatePassApp() {
   const updateLocationField = (k: keyof LocationForm, v: string) =>
     setLocationForm(f => ({ ...f, [k]: v }));
 
-  const saveLocation = () => {
+  const saveLocation = async () => {
     if (!locationForm.name.trim()) { setToast('Location name is required'); return; }
     try {
-      getStore().createLocation(locationForm);
-      reload();
+      await getStore().createLocation(locationForm);
+      await reload();
       setToast('Location saved');
       setView('admin_locations');
     } catch (e) { setToast((e as Error).message); }
@@ -1175,12 +1232,12 @@ export default function GatePassApp() {
   const updateUserRole = (v: 'admin' | 'garden') =>
     setUserForm(f => ({ ...f, role: v }));
 
-  const saveUser = () => {
+  const saveUser = async () => {
     if (!userForm.username.trim()) { setToast('User name is required'); return; }
     if (!userForm.password.trim()) { setToast('Password is required'); return; }
     try {
-      getStore().createUserAccount(userForm);
-      reload();
+      await getStore().createUserAccount(userForm);
+      await reload();
       setToast('User account saved');
       setView('admin_users');
     } catch (e) { setToast((e as Error).message); }
@@ -1192,15 +1249,24 @@ export default function GatePassApp() {
     setView('admin_reset_password');
   };
 
-  const saveResetPassword = () => {
+  const saveResetPassword = async () => {
     if (!resetPasswordUserId) return;
     if (!resetPasswordValue.trim()) { setToast('New password is required'); return; }
     try {
-      getStore().resetPassword(resetPasswordUserId, resetPasswordValue);
-      reload();
+      await getStore().resetPassword(resetPasswordUserId, resetPasswordValue);
+      await reload();
       setResetPasswordUserId(null);
       setToast('Password reset');
       setView('admin_users');
+    } catch (e) { setToast((e as Error).message); }
+  };
+
+  const deleteUser = async (u: UserAccount) => {
+    if (!window.confirm(`Delete user account "${u.username}"? This cannot be undone.`)) return;
+    try {
+      await getStore().deleteUserAccount(u.id);
+      await reload();
+      setToast('User account deleted');
     } catch (e) { setToast((e as Error).message); }
   };
 
@@ -1219,28 +1285,28 @@ export default function GatePassApp() {
   const updateNumberSettingsField = (k: keyof typeof numberSettingsForm, v: string) =>
     setNumberSettingsForm(f => ({ ...f, [k]: v }));
 
-  const saveNumberSettings = () => {
+  const saveNumberSettings = async () => {
     const gpNext = parseInt(numberSettingsForm.gpNext, 10);
     const dnNext = parseInt(numberSettingsForm.dnNext, 10);
     if (!numberSettingsForm.gpPrefix.trim() || !numberSettingsForm.dnPrefix.trim()) { setToast('Prefix is required for both sequences'); return; }
     if (!Number.isFinite(gpNext) || gpNext < 1 || !Number.isFinite(dnNext) || dnNext < 1) { setToast('Next number must be a positive number'); return; }
     try {
-      getStore().updateNumberSettings({ gpPrefix: numberSettingsForm.gpPrefix, gpNext, dnPrefix: numberSettingsForm.dnPrefix, dnNext });
-      reload();
+      await getStore().updateNumberSettings({ gpPrefix: numberSettingsForm.gpPrefix, gpNext, dnPrefix: numberSettingsForm.dnPrefix, dnNext });
+      await reload();
       setToast('Number sequence updated');
     } catch (e) { setToast((e as Error).message); }
   };
 
   // ── Scan handlers ──
-  const doScan = (code: string) => {
+  const doScan = async (code: string) => {
     if (!code.trim() || !scanDnNo) return;
     try {
-      getStore().addSerial(scanDnNo, scanLineSlNo, code.trim());
-      reload();
+      await getStore().addSerial(scanDnNo, scanLineSlNo, code.trim());
+      await reload();
       setScanFeedback({ msg: `✓  ${code.trim()} scanned`, ok: true });
       setTimeout(() => setScanFeedback(null), 2500);
       // auto-advance to next incomplete line
-      const fresh = getStore().loadAll().dns.find(d => d.no === scanDnNo);
+      const fresh = (await getStore().loadAll()).dns.find(d => d.no === scanDnNo);
       if (fresh) {
         const cur = fresh.lines.find(l => l.slNo === scanLineSlNo);
         if (cur && cur.serials.length >= cur.deliveryQty) {
@@ -1256,18 +1322,18 @@ export default function GatePassApp() {
     setTimeout(() => scanRef.current?.focus(), 50);
   };
 
-  const removeSerial = (dnNo: string, slNo: number, code: string) => {
+  const removeSerial = async (dnNo: string, slNo: number, code: string) => {
     try {
-      getStore().removeSerial(dnNo, slNo, code);
-      reload();
+      await getStore().removeSerial(dnNo, slNo, code);
+      await reload();
     } catch (e) { setToast((e as Error).message); }
   };
 
-  const completeDn = () => {
+  const completeDn = async () => {
     if (!scanDnNo) return;
     try {
-      getStore().completeDeliveryNote(scanDnNo);
-      reload();
+      await getStore().completeDeliveryNote(scanDnNo);
+      await reload();
       setActiveDnNo(scanDnNo);
       setScanDnNo(null);
       setView(auth?.role === 'admin' ? 'admin_view_dn' : 'garden_view_dn');
@@ -1836,47 +1902,47 @@ export default function GatePassApp() {
                 setScanInput(''); setScanFeedback(null);
                 setView('garden_scan');
               }}
-              onRemoveSerial={(slNo, code) => {
-                removeSerial(activeDn.no, slNo, code);
-                reload();
-                const fresh = getStore().loadAll().dns.find(d => d.no === activeDn.no);
+              onRemoveSerial={async (slNo, code) => {
+                await removeSerial(activeDn.no, slNo, code);
+                await reload();
+                const fresh = (await getStore().loadAll()).dns.find(d => d.no === activeDn.no);
                 if (fresh) setActiveDnNo(fresh.no);
               }}
               onPrint={() => window.print()}
-              onSaveHeader={(dnNo, form) => {
+              onSaveHeader={async (dnNo, form) => {
                 try {
-                  getStore().updateDeliveryNoteHeader(dnNo, form);
-                  reload();
+                  await getStore().updateDeliveryNoteHeader(dnNo, form);
+                  await reload();
                 } catch (e) { setToast((e as Error).message); }
               }}
-              onSaveLine={(dnNo, slNo, form) => {
+              onSaveLine={async (dnNo, slNo, form) => {
                 try {
-                  getStore().updateDeliveryNoteLine(dnNo, slNo, form);
-                  reload();
+                  await getStore().updateDeliveryNoteLine(dnNo, slNo, form);
+                  await reload();
                 } catch (e) { setToast((e as Error).message); }
               }}
-              onSaveDoRef={(dnNo, slNo, doRef) => {
+              onSaveDoRef={async (dnNo, slNo, doRef) => {
                 try {
-                  getStore().updateDeliveryNoteLineDoRef(dnNo, slNo, doRef);
-                  reload();
+                  await getStore().updateDeliveryNoteLineDoRef(dnNo, slNo, doRef);
+                  await reload();
                 } catch (e) { setToast((e as Error).message); }
               }}
-              onSaveGpRefs={(gpNo, form) => {
+              onSaveGpRefs={async (gpNo, form) => {
                 try {
-                  getStore().updateGatePassHeaderRefs(gpNo, form);
-                  reload();
+                  await getStore().updateGatePassHeaderRefs(gpNo, form);
+                  await reload();
                 } catch (e) { setToast((e as Error).message); }
               }}
-              onSplitLine={(dnNo, slNo) => {
+              onSplitLine={async (dnNo, slNo) => {
                 try {
-                  getStore().splitDeliveryNoteLine(dnNo, slNo);
-                  reload();
+                  await getStore().splitDeliveryNoteLine(dnNo, slNo);
+                  await reload();
                 } catch (e) { setToast((e as Error).message); }
               }}
-              onRemoveLine={(dnNo, slNo) => {
+              onRemoveLine={async (dnNo, slNo) => {
                 try {
-                  getStore().removeDeliveryNoteLine(dnNo, slNo);
-                  reload();
+                  await getStore().removeDeliveryNoteLine(dnNo, slNo);
+                  await reload();
                 } catch (e) { setToast((e as Error).message); }
               }}
             />
@@ -2181,9 +2247,12 @@ export default function GatePassApp() {
                         <td style={{ padding: '13px 16px', fontSize: 13.5, color: '#46514a' }}>{u.createdBy}</td>
                         <td style={{ padding: '13px 16px', fontSize: 13.5, color: '#46514a' }}>{u.createdAt}</td>
                         <td style={{ padding: '13px 16px' }}><LastModified by={u.modifiedBy} at={u.modifiedAt} /></td>
-                        <td style={{ padding: '13px 16px', textAlign: 'right' }}>
+                        <td style={{ padding: '13px 16px', textAlign: 'right', whiteSpace: 'nowrap' }}>
                           <button onClick={() => openResetPassword(u)} style={{ background: 'none', border: 'none', color: C.primary, fontWeight: 700, fontSize: 13, cursor: 'pointer', fontFamily: 'inherit' }}>
                             Reset Password
+                          </button>
+                          <button onClick={() => deleteUser(u)} style={{ background: 'none', border: 'none', color: '#c46', fontWeight: 700, fontSize: 13, cursor: 'pointer', fontFamily: 'inherit', marginLeft: 14 }}>
+                            Delete
                           </button>
                         </td>
                       </tr>
@@ -2603,9 +2672,9 @@ export default function GatePassApp() {
               onScanKey={e => { if (e.key === 'Enter') doScan(scanInput); }}
               onSimulate={simulateScan}
               onSelectLine={setScanLineSlNo}
-              onRemoveSerial={(slNo, code) => { removeSerial(scanDn.no, slNo, code); reload(); }}
+              onRemoveSerial={async (slNo, code) => { await removeSerial(scanDn.no, slNo, code); await reload(); }}
               onComplete={completeDn}
-              onBack={() => setView('garden_scanning')}
+              onBack={() => setView(auth?.role === 'admin' ? 'admin_dns' : 'garden_scanning')}
             />
           )}
 
@@ -2963,7 +3032,10 @@ function ViewDeliveryNote({ dn, gp, role, scanned, target, onBack, onContinueSca
   const renderDnCopy = () => (
     <>
       <div style={{ textAlign: 'center', position: 'relative' }}>
-        <div style={{ position: 'absolute', right: 0, top: 0 }}><Logo style={{ width: 98, height: 78, color: '#123c2b' }} /></div>
+        <div style={{ position: 'absolute', right: 0, top: 0, display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 4 }}>
+          <Logo style={{ width: 98, height: 78, color: '#123c2b' }} />
+          <QrCode value={dn.no} size={44} color="#b9c2bc" />
+        </div>
         <div style={{ fontWeight: 800, fontSize: 22 }}>Acacia LLC</div>
         <h2 style={{ fontFamily: 'var(--font-spectral),serif', fontWeight: 700, fontSize: 24, margin: '10px 0 0', textDecoration: 'underline', textUnderlineOffset: 5 }}>Delivery Note</h2>
       </div>
@@ -3082,11 +3154,6 @@ function ViewDeliveryNote({ dn, gp, role, scanned, target, onBack, onContinueSca
       <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 14 }} data-print-hide>
         <button onClick={onBack} style={{ background: 'none', border: 'none', color: '#5b6660', fontWeight: 600, fontSize: 13.5, cursor: 'pointer', fontFamily: 'inherit' }}>← Back</button>
         <div style={{ display: 'flex', gap: 10 }}>
-          {isScanning && role === 'garden' && (
-            <Btn onClick={onContinueScan} style={{ background: '#fff', border: '1px solid #cfd8d2', color: C.primary, borderRadius: 9, padding: '10px 18px', fontSize: 14, fontWeight: 700, cursor: 'pointer' }}>
-              Continue Scanning →
-            </Btn>
-          )}
           <Btn onClick={() => handleDownloadPdf(dnPdfFilename)} disabled={downloading} style={{ background: '#fff', border: `1px solid ${C.primary}`, color: C.primary, borderRadius: 9, padding: '10px 18px', fontSize: 14, fontWeight: 700, cursor: downloading ? 'default' : 'pointer', opacity: downloading ? 0.6 : 1 }}>
             {downloading ? 'Preparing PDF…' : 'Download PDF'}
           </Btn>
@@ -3117,10 +3184,23 @@ function ViewDeliveryNote({ dn, gp, role, scanned, target, onBack, onContinueSca
         </div>
       </div>
 
-      {/* Printable DN — screen/print view is a single copy; PDF export paginates + duplicates it (see buildDeliveryNotePdf) */}
+      {/* Printable DN — screen view is a single copy. PDF export paginates + duplicates it
+          (see buildDeliveryNotePdf); the browser Print output gets the same upper+lower
+          duplicate via the .print-only block below, which is invisible on screen. */}
       <div ref={printRef} data-print-doc style={{ background: '#fff', border: '1px solid #e2e7e3', borderRadius: 10, maxWidth: 920, margin: '0 auto', padding: '34px 44px' }}>
         {renderDnCopy()}
+        <div className="print-only">
+          <div style={{ position: 'relative', borderTop: '1px dashed #9aa39d', margin: '24px 0 0', paddingTop: 14 }}>
+            <span style={{ position: 'absolute', left: '50%', top: -8, transform: 'translateX(-50%)', background: '#fff', padding: '0 10px', fontSize: 11, color: '#9aa39d', letterSpacing: '.04em' }}>✂ cut here</span>
+          </div>
+          {renderDnCopy()}
+        </div>
         <div data-print-hide style={{ display: 'flex', justifyContent: 'flex-end', gap: 10, marginTop: 24 }}>
+          {isScanning && (
+            <Btn onClick={onContinueScan} style={{ background: C.white, border: '1px solid #cfd8d2', color: C.primary, borderRadius: 9, padding: '10px 18px', fontSize: 14, fontWeight: 700, cursor: 'pointer' }}>
+              Scanner
+            </Btn>
+          )}
           <Btn onClick={() => exportDnScanSheet(dn)} style={{ background: C.white, border: `1px solid ${C.primary}`, color: C.primary, borderRadius: 9, padding: '10px 18px', fontSize: 14, fontWeight: 700, cursor: 'pointer' }}>
             QR Code
           </Btn>

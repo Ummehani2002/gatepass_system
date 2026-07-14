@@ -79,12 +79,17 @@ See [ARCHITECTURE.md § File Structure](./ARCHITECTURE.md#2-file-structure).
 
 ## Deploying
 
-1. Push to GitHub, import into [Vercel](https://vercel.com).
-2. Set `DATABASE_URL`, `AUTH_SECRET`, `NEXT_PUBLIC_APP_URL` (and optionally
-   `UPSTASH_REDIS_REST_URL` / `UPSTASH_REDIS_REST_TOKEN`) as environment
-   variables.
-3. Run `npm run db:migrate` against the production database (e.g. from CI, or
-   once locally with the production `DATABASE_URL`) before first deploy.
+See **[DEPLOY.md](./DEPLOY.md)** for the free production setup (Neon Postgres + Render API + Vercel UI) with shared database.
+
+Quick summary:
+
+1. Neon → create DB, run `gatepass-backend` `db:setup` + `db:seed`
+2. Render → deploy `gatepass-backend` with `DATABASE_URL`, `JWT_SECRET`, `CORS_ORIGIN`
+3. Vercel → deploy frontend with `NEXT_PUBLIC_API_URL` pointing at the Render API
+
+For local demo without a database, leave `NEXT_PUBLIC_API_URL` empty (browser `localStorage` mode).
+
+Legacy TaskFlow routes (`/login`, org dashboards) are still in this repo but are not part of the Gate Pass product path.
 
 ## What's intentionally out of scope for v1
 

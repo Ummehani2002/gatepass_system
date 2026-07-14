@@ -1,6 +1,6 @@
 // Acacia LLC Gate Pass System — TypeScript data store
 // Two modes: local (localStorage) and api (Express backend).
-// Default is local mode — works with no server.
+// Set NEXT_PUBLIC_API_URL to use the shared database API.
 
 import { nanoid } from 'nanoid';
 
@@ -128,6 +128,63 @@ export interface AppData {
   numberSettings: NumberSettings;
 }
 
+
+export type AuthUser = { name: string; role: 'admin' | 'garden' };
+
+export type GatePassForm = {
+  customerName: string;
+  customerCode: string;
+  doNo: string;
+  doDate: string;
+  lpoNo: string;
+  lpoDate: string;
+  prRef: string;
+  soRef: string;
+  project: string;
+  party: string;
+  assignedTo: string[];
+  lines: Array<{ plantCode: string; plantDesc: string; potSize: string; height: string; girth: string; qty: string; postedQty: string; remainingQty: string; location: string }>;
+};
+
+export type DeliveryNoteForm = {
+  gpNo: string;
+  customerProject: string;
+  date: string;
+  vhNumber: string;
+  project: string;
+  lines: Array<{ slNo: number; deliveryQty: number; remarks: string; location: string }>;
+};
+
+export interface DataStore {
+  auth: AuthUser | null;
+  login(username: string, password: string): Promise<AuthUser>;
+  logout(): Promise<void> | void;
+  loadAll(): Promise<AppData>;
+  getNumberSettings(): Promise<NumberSettings>;
+  updateNumberSettings(settings: NumberSettings): Promise<NumberSettings>;
+  createGatePass(form: GatePassForm): Promise<GatePass>;
+  updateGatePass(no: string, form: GatePassForm): Promise<GatePass>;
+  createDeliveryNote(form: DeliveryNoteForm): Promise<DeliveryNote>;
+  updateDeliveryNoteHeader(dnNo: string, form: { customerProject: string; vhNumber: string; project: string; date: string }): Promise<DeliveryNote>;
+  updateDeliveryNoteLine(dnNo: string, slNo: number, form: { postedQty: string; remarks: string }): Promise<DeliveryNote>;
+  updateDeliveryNoteLineDoRef(dnNo: string, slNo: number, doRef: string): Promise<DeliveryNote>;
+  updateGatePassHeaderRefs(gpNo: string, form: { soRef: string; prRef: string; lpoNo: string }): Promise<GatePass>;
+  splitDeliveryNoteLine(dnNo: string, slNo: number): Promise<DeliveryNote>;
+  removeDeliveryNoteLine(dnNo: string, slNo: number): Promise<DeliveryNote>;
+  addSerial(dnNo: string, slNo: number, code: string): Promise<DeliveryNote>;
+  removeSerial(dnNo: string, slNo: number, code: string): Promise<DeliveryNote>;
+  completeDeliveryNote(dnNo: string): Promise<DeliveryNote>;
+  createCustomer(form: { customerName: string; party: 'EXT' | 'INT'; projects: string[] }): Promise<Customer>;
+  updateCustomer(id: string, form: { customerName: string; party: 'EXT' | 'INT'; projects: string[] }): Promise<Customer>;
+  createPlantMaster(form: { category: string; plantName: string }): Promise<PlantMaster>;
+  createPlantsBulk(rows: Array<{ category: string; plantName: string }>): Promise<PlantMaster[]>;
+  createLocation(form: { name: string }): Promise<LocationMaster>;
+  createUserAccount(form: { username: string; password: string; role: 'admin' | 'garden' }): Promise<UserAccount>;
+  resetPassword(id: string, newPassword: string): Promise<UserAccount>;
+  deleteUserAccount(id: string): Promise<void>;
+}
+
+
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 const LS_KEY = 'acacia_gp_v3';
@@ -220,10 +277,10 @@ function seedData(): AppData {
 
 // ── Local Store (localStorage backend) ───────────────────────────────────────
 
-export class LocalStore {
-  auth: { name: string; role: 'admin' | 'garden' } | null = null;
+export class LocalStore implements DataStore {
+  auth: AuthUser | null = null;
 
-  login(username: string, password: string): { name: string; role: 'admin' | 'garden' } {
+  async login(username: string, password: string): Promise<AuthUser> {
     const data = this.read();
     const u = data.users.find(u => u.username.toLowerCase() === (username || '').trim().toLowerCase());
     if (!u || u.password !== password) throw new Error('Invalid credentials');
@@ -231,7 +288,7 @@ export class LocalStore {
     return this.auth;
   }
 
-  logout() {
+  async logout() {
     this.auth = null;
   }
 
@@ -293,15 +350,15 @@ export class LocalStore {
     return this.formatSeqNo(data.numberSettings.dnPrefix, data.numberSettings.dnNext);
   }
 
-  loadAll(): AppData {
+  async loadAll(): Promise<AppData> {
     return this.read();
   }
 
-  getNumberSettings(): NumberSettings {
+  async getNumberSettings(): Promise<NumberSettings> {
     return this.read().numberSettings;
   }
 
-  updateNumberSettings(settings: NumberSettings): NumberSettings {
+  async updateNumberSettings(settings: NumberSettings): Promise<NumberSettings> {
     const data = this.read();
     const updated: NumberSettings = {
       gpPrefix: settings.gpPrefix.trim(),
@@ -313,20 +370,7 @@ export class LocalStore {
     return updated;
   }
 
-  createGatePass(form: {
-    customerName: string;
-    customerCode: string;
-    doNo: string;
-    doDate: string;
-    lpoNo: string;
-    lpoDate: string;
-    prRef: string;
-    soRef: string;
-    project: string;
-    party: string;
-    assignedTo: string[];
-    lines: Array<{ plantCode: string; plantDesc: string; potSize: string; height: string; girth: string; qty: string; postedQty: string; remainingQty: string; location: string }>;
-  }): GatePass {
+  async createGatePass(form: GatePassForm): Promise<GatePass> {
     const data = this.read();
     const lines: GPLine[] = form.lines
       .filter(l => l.plantDesc.trim() || l.plantCode.trim())
@@ -346,20 +390,7 @@ export class LocalStore {
     return gp;
   }
 
-  updateGatePass(no: string, form: {
-    customerName: string;
-    customerCode: string;
-    doNo: string;
-    doDate: string;
-    lpoNo: string;
-    lpoDate: string;
-    prRef: string;
-    soRef: string;
-    project: string;
-    party: string;
-    assignedTo: string[];
-    lines: Array<{ plantCode: string; plantDesc: string; potSize: string; height: string; girth: string; qty: string; postedQty: string; remainingQty: string; location: string }>;
-  }): GatePass {
+  async updateGatePass(no: string, form: GatePassForm): Promise<GatePass> {
     const data = this.read();
     const existing = data.gps.find(g => g.no === no);
     if (!existing) throw new Error('Gate pass not found');
@@ -382,14 +413,7 @@ export class LocalStore {
     return updated;
   }
 
-  createDeliveryNote(form: {
-    gpNo: string;
-    customerProject: string;
-    date: string;
-    vhNumber: string;
-    project: string;
-    lines: Array<{ slNo: number; deliveryQty: number; remarks: string; location: string }>;
-  }): DeliveryNote {
+  async createDeliveryNote(form: DeliveryNoteForm): Promise<DeliveryNote> {
     const data = this.read();
     const gp = data.gps.find(g => g.no === form.gpNo);
     if (!gp) throw new Error('Gate pass not found');
@@ -429,9 +453,9 @@ export class LocalStore {
     return dn;
   }
 
-  updateDeliveryNoteHeader(dnNo: string, form: {
+  async updateDeliveryNoteHeader(dnNo: string, form: {
     customerProject: string; vhNumber: string; project: string; date: string;
-  }): DeliveryNote {
+  }): Promise<DeliveryNote> {
     const data = this.read();
     const existing = data.dns.find(d => d.no === dnNo);
     if (!existing) throw new Error('Delivery note not found');
@@ -445,7 +469,7 @@ export class LocalStore {
     return updated;
   }
 
-  updateDeliveryNoteLine(dnNo: string, slNo: number, form: { postedQty: string; remarks: string }): DeliveryNote {
+  async updateDeliveryNoteLine(dnNo: string, slNo: number, form: { postedQty: string; remarks: string }): Promise<DeliveryNote> {
     const data = this.read();
     const dn = data.dns.find(d => d.no === dnNo);
     if (!dn) throw new Error('Delivery note not found');
@@ -462,7 +486,7 @@ export class LocalStore {
     return dn;
   }
 
-  updateDeliveryNoteLineDoRef(dnNo: string, slNo: number, doRef: string): DeliveryNote {
+  async updateDeliveryNoteLineDoRef(dnNo: string, slNo: number, doRef: string): Promise<DeliveryNote> {
     const data = this.read();
     const dn = data.dns.find(d => d.no === dnNo);
     if (!dn) throw new Error('Delivery note not found');
@@ -475,7 +499,7 @@ export class LocalStore {
     return dn;
   }
 
-  updateGatePassHeaderRefs(gpNo: string, form: { soRef: string; prRef: string; lpoNo: string }): GatePass {
+  async updateGatePassHeaderRefs(gpNo: string, form: { soRef: string; prRef: string; lpoNo: string }): Promise<GatePass> {
     const data = this.read();
     const gp = data.gps.find(g => g.no === gpNo);
     if (!gp) throw new Error('Gate pass not found');
@@ -488,7 +512,7 @@ export class LocalStore {
     return gp;
   }
 
-  splitDeliveryNoteLine(dnNo: string, slNo: number): DeliveryNote {
+  async splitDeliveryNoteLine(dnNo: string, slNo: number): Promise<DeliveryNote> {
     const data = this.read();
     const dn = data.dns.find(d => d.no === dnNo);
     if (!dn) throw new Error('Delivery note not found');
@@ -514,7 +538,7 @@ export class LocalStore {
     return dn;
   }
 
-  removeDeliveryNoteLine(dnNo: string, slNo: number): DeliveryNote {
+  async removeDeliveryNoteLine(dnNo: string, slNo: number): Promise<DeliveryNote> {
     const data = this.read();
     const dn = data.dns.find(d => d.no === dnNo);
     if (!dn) throw new Error('Delivery note not found');
@@ -529,7 +553,7 @@ export class LocalStore {
     return dn;
   }
 
-  addSerial(dnNo: string, slNo: number, code: string): DeliveryNote {
+  async addSerial(dnNo: string, slNo: number, code: string): Promise<DeliveryNote> {
     code = code.trim();
     if (!code) throw new Error('Empty barcode');
     const data = this.read();
@@ -547,7 +571,7 @@ export class LocalStore {
     return dn;
   }
 
-  removeSerial(dnNo: string, slNo: number, code: string): DeliveryNote {
+  async removeSerial(dnNo: string, slNo: number, code: string): Promise<DeliveryNote> {
     const data = this.read();
     const dn = data.dns.find(d => d.no === dnNo);
     if (!dn) throw new Error('Delivery note not found');
@@ -561,7 +585,7 @@ export class LocalStore {
     return dn;
   }
 
-  completeDeliveryNote(dnNo: string): DeliveryNote {
+  async completeDeliveryNote(dnNo: string): Promise<DeliveryNote> {
     const data = this.read();
     const dn = data.dns.find(d => d.no === dnNo);
     if (!dn) throw new Error('Delivery note not found');
@@ -574,7 +598,7 @@ export class LocalStore {
     return dn;
   }
 
-  createCustomer(form: { customerName: string; party: 'EXT' | 'INT'; projects: string[] }): Customer {
+  async createCustomer(form: { customerName: string; party: 'EXT' | 'INT'; projects: string[] }): Promise<Customer> {
     const data = this.read();
     const c: Customer = {
       id: nanoid(),
@@ -590,7 +614,7 @@ export class LocalStore {
     return c;
   }
 
-  updateCustomer(id: string, form: { customerName: string; party: 'EXT' | 'INT'; projects: string[] }): Customer {
+  async updateCustomer(id: string, form: { customerName: string; party: 'EXT' | 'INT'; projects: string[] }): Promise<Customer> {
     const data = this.read();
     const existing = data.customers.find(c => c.id === id);
     if (!existing) throw new Error('Customer not found');
@@ -602,7 +626,7 @@ export class LocalStore {
     return updated;
   }
 
-  createPlantMaster(form: { category: string; plantName: string }): PlantMaster {
+  async createPlantMaster(form: { category: string; plantName: string }): Promise<PlantMaster> {
     const data = this.read();
     const p: PlantMaster = {
       id: nanoid(),
@@ -617,7 +641,7 @@ export class LocalStore {
     return p;
   }
 
-  createPlantsBulk(rows: Array<{ category: string; plantName: string }>): PlantMaster[] {
+  async createPlantsBulk(rows: Array<{ category: string; plantName: string }>): Promise<PlantMaster[]> {
     const data = this.read();
     const createdBy = this.auth?.name || 'Admin';
     const createdAt = today();
@@ -634,7 +658,7 @@ export class LocalStore {
     return newPlants;
   }
 
-  createLocation(form: { name: string }): LocationMaster {
+  async createLocation(form: { name: string }): Promise<LocationMaster> {
     const data = this.read();
     const l: LocationMaster = {
       id: nanoid(),
@@ -648,7 +672,7 @@ export class LocalStore {
     return l;
   }
 
-  createUserAccount(form: { username: string; password: string; role: 'admin' | 'garden' }): UserAccount {
+  async createUserAccount(form: { username: string; password: string; role: 'admin' | 'garden' }): Promise<UserAccount> {
     const data = this.read();
     const uname = form.username.trim();
     if (data.users.some(u => u.username.toLowerCase() === uname.toLowerCase())) {
@@ -668,7 +692,20 @@ export class LocalStore {
     return u;
   }
 
-  resetPassword(id: string, newPassword: string): UserAccount {
+  async deleteUserAccount(id: string): Promise<void> {
+    const data = this.read();
+    const existing = data.users.find(u => u.id === id);
+    if (!existing) throw new Error('User not found');
+    if (existing.role === 'admin' && data.users.filter(u => u.role === 'admin').length <= 1) {
+      throw new Error('Cannot delete the last remaining Admin account');
+    }
+    if (this.auth?.name === existing.username) {
+      throw new Error('Cannot delete the account you are currently signed in with');
+    }
+    this.write({ ...data, users: data.users.filter(u => u.id !== id) });
+  }
+
+  async resetPassword(id: string, newPassword: string): Promise<UserAccount> {
     const data = this.read();
     const existing = data.users.find(u => u.id === id);
     if (!existing) throw new Error('User not found');
@@ -679,4 +716,214 @@ export class LocalStore {
     this.write({ ...data, users: data.users.map(u => u.id === id ? updated : u) });
     return updated;
   }
+}
+
+// ── API Store (Express + Postgres backend) ───────────────────────────────────
+
+const TOKEN_KEY = 'acacia_gp_token';
+const AUTH_KEY = 'acacia_gp_auth';
+
+export class ApiStore implements DataStore {
+  auth: AuthUser | null = null;
+  private baseUrl: string;
+
+  constructor(baseUrl: string) {
+    this.baseUrl = baseUrl.replace(/\/$/, '');
+    if (typeof window !== 'undefined') {
+      try {
+        const raw = localStorage.getItem(AUTH_KEY);
+        if (raw) this.auth = JSON.parse(raw) as AuthUser;
+      } catch {}
+    }
+  }
+
+  private token(): string | null {
+    if (typeof window === 'undefined') return null;
+    return localStorage.getItem(TOKEN_KEY);
+  }
+
+  private setSession(token: string, auth: AuthUser) {
+    this.auth = auth;
+    localStorage.setItem(TOKEN_KEY, token);
+    localStorage.setItem(AUTH_KEY, JSON.stringify(auth));
+  }
+
+  private clearSession() {
+    this.auth = null;
+    localStorage.removeItem(TOKEN_KEY);
+    localStorage.removeItem(AUTH_KEY);
+  }
+
+  private async request<T>(path: string, options: RequestInit = {}): Promise<T> {
+    const headers: Record<string, string> = {
+      'Content-Type': 'application/json',
+      ...(options.headers as Record<string, string> | undefined),
+    };
+    const token = this.token();
+    if (token) headers.Authorization = `Bearer ${token}`;
+
+    const res = await fetch(`${this.baseUrl}${path}`, { ...options, headers });
+    if (res.status === 204) return undefined as T;
+    const body = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      throw new Error((body as { error?: string }).error || `Request failed (${res.status})`);
+    }
+    return body as T;
+  }
+
+  async login(username: string, password: string): Promise<AuthUser> {
+    const data = await this.request<{ token: string; user: { username: string; role: 'admin' | 'garden' } }>(
+      '/api/auth/login',
+      { method: 'POST', body: JSON.stringify({ username, password }) }
+    );
+    // Use username (not display name) so assignedTo matching works like LocalStore
+    const auth: AuthUser = { name: data.user.username, role: data.user.role };
+    this.setSession(data.token, auth);
+    return auth;
+  }
+
+  async logout() {
+    this.clearSession();
+  }
+
+  async loadAll(): Promise<AppData> {
+    const [gps, dns, customers, plants, locations, users, numberSettings] = await Promise.all([
+      this.request<GatePass[]>('/api/gate-passes'),
+      this.request<DeliveryNote[]>('/api/delivery-notes'),
+      this.request<Customer[]>('/api/masters/customers'),
+      this.request<PlantMaster[]>('/api/masters/plants'),
+      this.request<LocationMaster[]>('/api/masters/locations'),
+      this.request<UserAccount[]>('/api/users'),
+      this.request<NumberSettings>('/api/masters/number-settings'),
+    ]);
+    return { gps, dns, customers, plants, locations, users, numberSettings };
+  }
+
+  async getNumberSettings(): Promise<NumberSettings> {
+    return this.request('/api/masters/number-settings');
+  }
+
+  async updateNumberSettings(settings: NumberSettings): Promise<NumberSettings> {
+    return this.request('/api/masters/number-settings', {
+      method: 'PUT',
+      body: JSON.stringify(settings),
+    });
+  }
+
+  async createGatePass(form: GatePassForm): Promise<GatePass> {
+    return this.request('/api/gate-passes', { method: 'POST', body: JSON.stringify(form) });
+  }
+
+  async updateGatePass(no: string, form: GatePassForm): Promise<GatePass> {
+    return this.request(`/api/gate-passes/${encodeURIComponent(no)}`, {
+      method: 'PUT',
+      body: JSON.stringify(form),
+    });
+  }
+
+  async createDeliveryNote(form: DeliveryNoteForm): Promise<DeliveryNote> {
+    return this.request('/api/delivery-notes', { method: 'POST', body: JSON.stringify(form) });
+  }
+
+  async updateDeliveryNoteHeader(dnNo: string, form: { customerProject: string; vhNumber: string; project: string; date: string }): Promise<DeliveryNote> {
+    return this.request(`/api/delivery-notes/${encodeURIComponent(dnNo)}/header`, {
+      method: 'PATCH',
+      body: JSON.stringify(form),
+    });
+  }
+
+  async updateDeliveryNoteLine(dnNo: string, slNo: number, form: { postedQty: string; remarks: string }): Promise<DeliveryNote> {
+    return this.request(`/api/delivery-notes/${encodeURIComponent(dnNo)}/lines/${slNo}`, {
+      method: 'PATCH',
+      body: JSON.stringify(form),
+    });
+  }
+
+  async updateDeliveryNoteLineDoRef(dnNo: string, slNo: number, doRef: string): Promise<DeliveryNote> {
+    return this.request(`/api/delivery-notes/${encodeURIComponent(dnNo)}/lines/${slNo}`, {
+      method: 'PATCH',
+      body: JSON.stringify({ doRef }),
+    });
+  }
+
+  async updateGatePassHeaderRefs(gpNo: string, form: { soRef: string; prRef: string; lpoNo: string }): Promise<GatePass> {
+    return this.request(`/api/gate-passes/${encodeURIComponent(gpNo)}/refs`, {
+      method: 'PATCH',
+      body: JSON.stringify(form),
+    });
+  }
+
+  async splitDeliveryNoteLine(dnNo: string, slNo: number): Promise<DeliveryNote> {
+    return this.request(`/api/delivery-notes/${encodeURIComponent(dnNo)}/lines/${slNo}/split`, {
+      method: 'POST',
+    });
+  }
+
+  async removeDeliveryNoteLine(dnNo: string, slNo: number): Promise<DeliveryNote> {
+    return this.request(`/api/delivery-notes/${encodeURIComponent(dnNo)}/lines/${slNo}`, {
+      method: 'DELETE',
+    });
+  }
+
+  async addSerial(dnNo: string, slNo: number, code: string): Promise<DeliveryNote> {
+    return this.request(`/api/delivery-notes/${encodeURIComponent(dnNo)}/lines/${slNo}/serials`, {
+      method: 'POST',
+      body: JSON.stringify({ code }),
+    });
+  }
+
+  async removeSerial(dnNo: string, slNo: number, code: string): Promise<DeliveryNote> {
+    return this.request(
+      `/api/delivery-notes/${encodeURIComponent(dnNo)}/lines/${slNo}/serials/${encodeURIComponent(code)}`,
+      { method: 'DELETE' }
+    );
+  }
+
+  async completeDeliveryNote(dnNo: string): Promise<DeliveryNote> {
+    return this.request(`/api/delivery-notes/${encodeURIComponent(dnNo)}/complete`, { method: 'POST' });
+  }
+
+  async createCustomer(form: { customerName: string; party: 'EXT' | 'INT'; projects: string[] }): Promise<Customer> {
+    return this.request('/api/masters/customers', { method: 'POST', body: JSON.stringify(form) });
+  }
+
+  async updateCustomer(id: string, form: { customerName: string; party: 'EXT' | 'INT'; projects: string[] }): Promise<Customer> {
+    return this.request(`/api/masters/customers/${encodeURIComponent(id)}`, {
+      method: 'PUT',
+      body: JSON.stringify(form),
+    });
+  }
+
+  async createPlantMaster(form: { category: string; plantName: string }): Promise<PlantMaster> {
+    return this.request('/api/masters/plants', { method: 'POST', body: JSON.stringify(form) });
+  }
+
+  async createPlantsBulk(rows: Array<{ category: string; plantName: string }>): Promise<PlantMaster[]> {
+    return this.request('/api/masters/plants/bulk', { method: 'POST', body: JSON.stringify(rows) });
+  }
+
+  async createLocation(form: { name: string }): Promise<LocationMaster> {
+    return this.request('/api/masters/locations', { method: 'POST', body: JSON.stringify(form) });
+  }
+
+  async createUserAccount(form: { username: string; password: string; role: 'admin' | 'garden' }): Promise<UserAccount> {
+    return this.request('/api/users', { method: 'POST', body: JSON.stringify(form) });
+  }
+
+  async resetPassword(id: string, newPassword: string): Promise<UserAccount> {
+    return this.request(`/api/users/${encodeURIComponent(id)}/password`, {
+      method: 'PATCH',
+      body: JSON.stringify({ password: newPassword }),
+    });
+  }
+
+  async deleteUserAccount(id: string): Promise<void> {
+    await this.request(`/api/users/${encodeURIComponent(id)}`, { method: 'DELETE' });
+  }
+}
+
+export function createStore(): DataStore {
+  const apiUrl = process.env.NEXT_PUBLIC_API_URL?.trim();
+  if (apiUrl) return new ApiStore(apiUrl);
+  return new LocalStore();
 }
