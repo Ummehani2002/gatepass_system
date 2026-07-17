@@ -4,13 +4,13 @@ import { useState, useEffect, useLayoutEffect, useRef } from 'react';
 import { createPortal } from 'react-dom';
 import * as XLSX from 'xlsx';
 import QRCode from 'qrcode';
-import { LocalStore, today, specOf } from '@/lib/gate-pass-store';
-import type { DeliveryNote, DNLine, GatePass, Customer, PlantMaster, LocationMaster, UserAccount, NumberSettings, LpoSoMapping } from '@/lib/gate-pass-store';
+import { createStore, today, specOf } from '@/lib/gate-pass-store';
+import type { DeliveryNote, DNLine, GatePass, Customer, PlantMaster, LocationMaster, UserAccount, NumberSettings, LpoSoMapping, DataStore } from '@/lib/gate-pass-store';
 
 // ── Store singleton ───────────────────────────────────────────────────────────
-let _store: LocalStore | null = null;
+let _store: DataStore | null = null;
 function getStore() {
-  if (!_store) _store = new LocalStore();
+  if (!_store) _store = createStore();
   return _store;
 }
 
@@ -908,8 +908,8 @@ export default function GatePassApp() {
   }, [toast]);
 
   // ── Data helpers ──
-  const reload = () => {
-    const d = getStore().loadAll();
+  const reload = async () => {
+    const d = await getStore().loadAll();
     setGps(d.gps);
     setDns(d.dns);
     setCustomers(d.customers);
@@ -920,6 +920,29 @@ export default function GatePassApp() {
     setLpoSoMappings(d.lpoSoMappings);
   };
 
+  // Restore API/local session after refresh
+  useEffect(() => {
+    const store = getStore();
+    if (!store.auth) return;
+    setAuth(store.auth);
+    void (async () => {
+      try {
+        const d = await store.loadAll();
+        setGps(d.gps);
+        setDns(d.dns);
+        setCustomers(d.customers);
+        setPlants(d.plants);
+        setLocations(d.locations);
+        setUsers(d.users);
+        setNumberSettings(d.numberSettings);
+        setView(store.auth!.role === 'admin' ? 'admin_dashboard' : 'garden_home');
+      } catch {
+        await store.logout();
+        setAuth(null);
+      }
+    })();
+  }, []);
+
   const activeGp = gps.find(g => g.no === activeGpNo) || null;
   const activeDn = dns.find(d => d.no === activeDnNo) || null;
   const scanDn   = dns.find(d => d.no === scanDnNo) || null;
@@ -929,11 +952,11 @@ export default function GatePassApp() {
   const kOpen = dns.filter(d => d.lines.some(l => lineStatus(l.postedQty, l.deliveryQty, l.hasSplit) === 'Open')).length;
 
   // ── Auth handlers ──
-  const signIn = () => {
+  const signIn = async () => {
     try {
-      const user = getStore().login(loginUser, loginPass);
+      const user = await getStore().login(loginUser, loginPass);
       setAuth(user);
-      reload();
+      await reload();
       setLoginErr('');
       setView(user.role === 'admin' ? 'admin_dashboard' : 'garden_home');
     } catch (e) {
@@ -941,8 +964,8 @@ export default function GatePassApp() {
     }
   };
 
-  const logout = () => {
-    getStore().logout();
+  const logout = async () => {
+    await getStore().logout();
     setAuth(null); setLoginRole(null);
     setLoginUser(''); setLoginPass(''); setLoginErr('');
     setView('login_roles');
@@ -1010,27 +1033,27 @@ export default function GatePassApp() {
   const removeGpLine = (idx: number) =>
     setGpForm(f => ({ ...f, lines: f.lines.filter(l => l.idx !== idx) }));
 
-  const saveGp = () => {
+  const saveGp = async () => {
     if (!gpForm.customerName.trim()) { setToast('Customer name is required'); return; }
     const validLines = gpForm.lines.filter(l => l.plantDesc.trim() || l.plantCode.trim());
     if (!validLines.length) { setToast('At least one plant line is required'); return; }
     if (!gpForm.assignedTo.length) { setToast('Please assign at least one user before submitting'); return; }
     try {
       if (editingGpNo) {
-        getStore().updateGatePass(editingGpNo, { ...gpForm, lines: validLines });
+        await getStore().updateGatePass(editingGpNo, { ...gpForm, lines: validLines });
         setToast('Gate pass updated');
-        reload();
+        await reload();
         setEditingGpNo(null);
         setView('admin_gps');
       } else if (gpForGardenDn) {
-        const gp = getStore().createGatePass({ ...gpForm, lines: validLines });
-        reload();
+        const gp = await getStore().createGatePass({ ...gpForm, lines: validLines });
+        await reload();
         setGpForGardenDn(false);
         openNewDn(gp);
       } else {
-        getStore().createGatePass({ ...gpForm, lines: validLines });
+        await getStore().createGatePass({ ...gpForm, lines: validLines });
         setToast('Gate pass saved');
-        reload();
+        await reload();
         setEditingGpNo(null);
         setView('admin_gps');
       }
@@ -1059,15 +1082,15 @@ export default function GatePassApp() {
       ...f, lines: f.lines.map(l => l.slNo === slNo ? { ...l, [k]: v } : l),
     } : f);
 
-  const saveDn = (startScanning: boolean) => {
+  const saveDn = async (startScanning: boolean) => {
     if (!dnForm) return;
     if (!dnForm.vhNumber.trim()) { setToast('Vehicle number is required'); return; }
     try {
-      const dn = getStore().createDeliveryNote({
+      const dn = await getStore().createDeliveryNote({
         ...dnForm,
         lines: dnForm.lines.map(l => ({ slNo: l.slNo, deliveryQty: Number(l.deliveryQty) || 0, remarks: l.remarks, location: l.location })),
       });
-      reload();
+      await reload();
       setDnForm(null);
       if (startScanning) {
         setScanDnNo(dn.no);
@@ -1115,19 +1138,19 @@ export default function GatePassApp() {
   const removeCustomerProject = (idx: number) =>
     setCustomerForm(f => ({ ...f, projects: f.projects.filter(p => p.idx !== idx) }));
 
-  const saveCustomer = () => {
+  const saveCustomer = async () => {
     if (!customerForm.customerName.trim()) { setToast('Customer name is required'); return; }
     const validProjects = Array.from(new Set(customerForm.projects.map(p => p.value.trim()).filter(Boolean)));
     if (!validProjects.length) { setToast('At least one project is required'); return; }
     try {
       if (editingCustomerId) {
-        getStore().updateCustomer(editingCustomerId, { customerName: customerForm.customerName, party: customerForm.party, projects: validProjects });
+        await getStore().updateCustomer(editingCustomerId, { customerName: customerForm.customerName, party: customerForm.party, projects: validProjects });
         setToast('Customer updated');
       } else {
-        getStore().createCustomer({ customerName: customerForm.customerName, party: customerForm.party, projects: validProjects });
+        await getStore().createCustomer({ customerName: customerForm.customerName, party: customerForm.party, projects: validProjects });
         setToast('Customer saved');
       }
-      reload();
+      await reload();
       setEditingCustomerId(null);
       setView('admin_customers');
     } catch (e) { setToast((e as Error).message); }
@@ -1142,12 +1165,12 @@ export default function GatePassApp() {
   const updatePlantField = (k: keyof PlantForm, v: string) =>
     setPlantForm(f => ({ ...f, [k]: v }));
 
-  const savePlant = () => {
+  const savePlant = async () => {
     if (!plantForm.category.trim()) { setToast('Category is required'); return; }
     if (!plantForm.plantName.trim()) { setToast('Plant name is required'); return; }
     try {
-      getStore().createPlantMaster(plantForm);
-      reload();
+      await getStore().createPlantMaster(plantForm);
+      await reload();
       setToast('Plant saved');
       setView('admin_plants');
     } catch (e) { setToast((e as Error).message); }
@@ -1181,8 +1204,8 @@ export default function GatePassApp() {
         setToast('No valid rows found — expected "Category" and "Plant Name" columns');
         return;
       }
-      getStore().createPlantsBulk(parsed);
-      reload();
+      await getStore().createPlantsBulk(parsed);
+      await reload();
       setToast(`Imported ${parsed.length} plant${parsed.length === 1 ? '' : 's'}`);
     } catch {
       setToast('Could not read the Excel file');
@@ -1198,11 +1221,11 @@ export default function GatePassApp() {
   const updateLocationField = (k: keyof LocationForm, v: string) =>
     setLocationForm(f => ({ ...f, [k]: v }));
 
-  const saveLocation = () => {
+  const saveLocation = async () => {
     if (!locationForm.name.trim()) { setToast('Location name is required'); return; }
     try {
-      getStore().createLocation(locationForm);
-      reload();
+      await getStore().createLocation(locationForm);
+      await reload();
       setToast('Location saved');
       setView('admin_locations');
     } catch (e) { setToast((e as Error).message); }
@@ -1217,11 +1240,11 @@ export default function GatePassApp() {
   const updateLpoSoField = (k: keyof LpoSoForm, v: string) =>
     setLpoSoForm(f => ({ ...f, [k]: v }));
 
-  const saveLpoSo = () => {
+  const saveLpoSo = async () => {
     if (!lpoSoForm.customerName.trim()) { setToast('Customer name is required'); return; }
     try {
-      getStore().createLpoSoMapping(lpoSoForm);
-      reload();
+      await getStore().createLpoSoMapping(lpoSoForm);
+      await reload();
       setToast('LPO / SO mapping saved');
       setView('admin_lposo');
     } catch (e) { setToast((e as Error).message); }
@@ -1239,12 +1262,12 @@ export default function GatePassApp() {
   const updateUserRole = (v: 'admin' | 'garden') =>
     setUserForm(f => ({ ...f, role: v }));
 
-  const saveUser = () => {
+  const saveUser = async () => {
     if (!userForm.username.trim()) { setToast('User name is required'); return; }
     if (!userForm.password.trim()) { setToast('Password is required'); return; }
     try {
-      getStore().createUserAccount(userForm);
-      reload();
+      await getStore().createUserAccount(userForm);
+      await reload();
       setToast('User account saved');
       setView('admin_users');
     } catch (e) { setToast((e as Error).message); }
@@ -1256,23 +1279,23 @@ export default function GatePassApp() {
     setView('admin_reset_password');
   };
 
-  const saveResetPassword = () => {
+  const saveResetPassword = async () => {
     if (!resetPasswordUserId) return;
     if (!resetPasswordValue.trim()) { setToast('New password is required'); return; }
     try {
-      getStore().resetPassword(resetPasswordUserId, resetPasswordValue);
-      reload();
+      await getStore().resetPassword(resetPasswordUserId, resetPasswordValue);
+      await reload();
       setResetPasswordUserId(null);
       setToast('Password reset');
       setView('admin_users');
     } catch (e) { setToast((e as Error).message); }
   };
 
-  const deleteUser = (u: UserAccount) => {
+  const deleteUser = async (u: UserAccount) => {
     if (!window.confirm(`Delete user account "${u.username}"? This cannot be undone.`)) return;
     try {
-      getStore().deleteUserAccount(u.id);
-      reload();
+      await getStore().deleteUserAccount(u.id);
+      await reload();
       setToast('User account deleted');
     } catch (e) { setToast((e as Error).message); }
   };
@@ -1292,28 +1315,28 @@ export default function GatePassApp() {
   const updateNumberSettingsField = (k: keyof typeof numberSettingsForm, v: string) =>
     setNumberSettingsForm(f => ({ ...f, [k]: v }));
 
-  const saveNumberSettings = () => {
+  const saveNumberSettings = async () => {
     const gpNext = parseInt(numberSettingsForm.gpNext, 10);
     const dnNext = parseInt(numberSettingsForm.dnNext, 10);
     if (!numberSettingsForm.gpPrefix.trim() || !numberSettingsForm.dnPrefix.trim()) { setToast('Prefix is required for both sequences'); return; }
     if (!Number.isFinite(gpNext) || gpNext < 1 || !Number.isFinite(dnNext) || dnNext < 1) { setToast('Next number must be a positive number'); return; }
     try {
-      getStore().updateNumberSettings({ gpPrefix: numberSettingsForm.gpPrefix, gpNext, dnPrefix: numberSettingsForm.dnPrefix, dnNext });
-      reload();
+      await getStore().updateNumberSettings({ gpPrefix: numberSettingsForm.gpPrefix, gpNext, dnPrefix: numberSettingsForm.dnPrefix, dnNext });
+      await reload();
       setToast('Number sequence updated');
     } catch (e) { setToast((e as Error).message); }
   };
 
   // ── Scan handlers ──
-  const doScan = (code: string) => {
+  const doScan = async (code: string) => {
     if (!code.trim() || !scanDnNo) return;
     try {
-      getStore().addSerial(scanDnNo, scanLineSlNo, code.trim());
-      reload();
+      await getStore().addSerial(scanDnNo, scanLineSlNo, code.trim());
+      await reload();
       setScanFeedback({ msg: `✓  ${code.trim()} scanned`, ok: true });
       setTimeout(() => setScanFeedback(null), 2500);
       // auto-advance to next incomplete line
-      const fresh = getStore().loadAll().dns.find(d => d.no === scanDnNo);
+      const fresh = (await getStore().loadAll()).dns.find(d => d.no === scanDnNo);
       if (fresh) {
         const cur = fresh.lines.find(l => l.slNo === scanLineSlNo);
         if (cur && cur.serials.length >= cur.deliveryQty) {
@@ -1329,18 +1352,18 @@ export default function GatePassApp() {
     setTimeout(() => scanRef.current?.focus(), 50);
   };
 
-  const removeSerial = (dnNo: string, slNo: number, code: string) => {
+  const removeSerial = async (dnNo: string, slNo: number, code: string) => {
     try {
-      getStore().removeSerial(dnNo, slNo, code);
-      reload();
+      await getStore().removeSerial(dnNo, slNo, code);
+      await reload();
     } catch (e) { setToast((e as Error).message); }
   };
 
-  const completeDn = () => {
+  const completeDn = async () => {
     if (!scanDnNo) return;
     try {
-      getStore().completeDeliveryNote(scanDnNo);
-      reload();
+      await getStore().completeDeliveryNote(scanDnNo);
+      await reload();
       setActiveDnNo(scanDnNo);
       setScanDnNo(null);
       setView(auth?.role === 'admin' ? 'admin_view_dn' : 'garden_view_dn');
@@ -1910,47 +1933,47 @@ export default function GatePassApp() {
                 setScanInput(''); setScanFeedback(null);
                 setView('garden_scan');
               }}
-              onRemoveSerial={(slNo, code) => {
-                removeSerial(activeDn.no, slNo, code);
-                reload();
-                const fresh = getStore().loadAll().dns.find(d => d.no === activeDn.no);
+              onRemoveSerial={async (slNo, code) => {
+                await removeSerial(activeDn.no, slNo, code);
+                await reload();
+                const fresh = (await getStore().loadAll()).dns.find(d => d.no === activeDn.no);
                 if (fresh) setActiveDnNo(fresh.no);
               }}
               onPrint={() => window.print()}
-              onSaveHeader={(dnNo, form) => {
+              onSaveHeader={async (dnNo, form) => {
                 try {
-                  getStore().updateDeliveryNoteHeader(dnNo, form);
-                  reload();
+                  await getStore().updateDeliveryNoteHeader(dnNo, form);
+                  await reload();
                 } catch (e) { setToast((e as Error).message); }
               }}
-              onSaveLine={(dnNo, slNo, form) => {
+              onSaveLine={async (dnNo, slNo, form) => {
                 try {
-                  getStore().updateDeliveryNoteLine(dnNo, slNo, form);
-                  reload();
+                  await getStore().updateDeliveryNoteLine(dnNo, slNo, form);
+                  await reload();
                 } catch (e) { setToast((e as Error).message); }
               }}
-              onSaveDoRef={(dnNo, slNo, doRef) => {
+              onSaveDoRef={async (dnNo, slNo, doRef) => {
                 try {
-                  getStore().updateDeliveryNoteLineDoRef(dnNo, slNo, doRef);
-                  reload();
+                  await getStore().updateDeliveryNoteLineDoRef(dnNo, slNo, doRef);
+                  await reload();
                 } catch (e) { setToast((e as Error).message); }
               }}
-              onSaveGpRefs={(gpNo, form) => {
+              onSaveGpRefs={async (gpNo, form) => {
                 try {
-                  getStore().updateGatePassHeaderRefs(gpNo, form);
-                  reload();
+                  await getStore().updateGatePassHeaderRefs(gpNo, form);
+                  await reload();
                 } catch (e) { setToast((e as Error).message); }
               }}
-              onSplitLine={(dnNo, slNo) => {
+              onSplitLine={async (dnNo, slNo) => {
                 try {
-                  getStore().splitDeliveryNoteLine(dnNo, slNo);
-                  reload();
+                  await getStore().splitDeliveryNoteLine(dnNo, slNo);
+                  await reload();
                 } catch (e) { setToast((e as Error).message); }
               }}
-              onRemoveLine={(dnNo, slNo) => {
+              onRemoveLine={async (dnNo, slNo) => {
                 try {
-                  getStore().removeDeliveryNoteLine(dnNo, slNo);
-                  reload();
+                  await getStore().removeDeliveryNoteLine(dnNo, slNo);
+                  await reload();
                 } catch (e) { setToast((e as Error).message); }
               }}
             />
@@ -2764,7 +2787,7 @@ export default function GatePassApp() {
               onScanKey={e => { if (e.key === 'Enter') doScan(scanInput); }}
               onSimulate={simulateScan}
               onSelectLine={setScanLineSlNo}
-              onRemoveSerial={(slNo, code) => { removeSerial(scanDn.no, slNo, code); reload(); }}
+              onRemoveSerial={async (slNo, code) => { await removeSerial(scanDn.no, slNo, code); await reload(); }}
               onComplete={completeDn}
               onBack={() => setView(auth?.role === 'admin' ? 'admin_dns' : 'garden_scanning')}
             />

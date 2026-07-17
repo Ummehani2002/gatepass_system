@@ -6,15 +6,17 @@ const PUBLIC_PATHS = new Set(["/", "/login", "/register"]);
 
 function getSecretKey() {
   const secret = process.env.AUTH_SECRET;
-  if (!secret) throw new Error("AUTH_SECRET environment variable is not set");
+  if (!secret) return null;
   return new TextEncoder().encode(secret);
 }
 
 async function hasValidSession(request: NextRequest): Promise<boolean> {
+  const key = getSecretKey();
+  if (!key) return false;
   const token = request.cookies.get(SESSION_COOKIE)?.value;
   if (!token) return false;
   try {
-    await jwtVerify(token, getSecretKey());
+    await jwtVerify(token, key);
     return true;
   } catch {
     return false;
@@ -22,6 +24,12 @@ async function hasValidSession(request: NextRequest): Promise<boolean> {
 }
 
 export async function middleware(request: NextRequest) {
+  // Gate Pass lives at "/". If AUTH_SECRET is unset (typical Gate Pass deploy),
+  // skip TaskFlow session checks so the app works without TaskFlow env vars.
+  if (!process.env.AUTH_SECRET) {
+    return NextResponse.next();
+  }
+
   const { pathname } = request.nextUrl;
 
   if (PUBLIC_PATHS.has(pathname)) {
