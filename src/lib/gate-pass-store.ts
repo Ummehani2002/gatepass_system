@@ -111,6 +111,18 @@ export interface UserAccount {
   modifiedAt: string | null;
 }
 
+export interface LpoSoMapping {
+  id: string;
+  customerName: string;
+  project: string;
+  poNo: string;
+  soRef: string;
+  createdBy: string;
+  createdAt: string;
+  modifiedBy: string | null;
+  modifiedAt: string | null;
+}
+
 export interface NumberSettings {
   gpPrefix: string;
   gpNext: number;
@@ -126,6 +138,7 @@ export interface AppData {
   locations: LocationMaster[];
   users: UserAccount[];
   numberSettings: NumberSettings;
+  lpoSoMappings: LpoSoMapping[];
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -215,6 +228,7 @@ function seedData(): AppData {
     locations: defaultLocations(),
     users: defaultUsers(),
     numberSettings: defaultNumberSettings(),
+    lpoSoMappings: [],
   };
 }
 
@@ -264,6 +278,7 @@ export class LocalStore {
             users: ((d.users && d.users.length) ? d.users : defaultUsers())
               .map(u => ({ ...u, modifiedBy: u.modifiedBy ?? null, modifiedAt: u.modifiedAt ?? null })),
             numberSettings: d.numberSettings ?? defaultNumberSettings(),
+            lpoSoMappings: (d.lpoSoMappings || []).map(m => ({ ...m, modifiedBy: m.modifiedBy ?? null, modifiedAt: m.modifiedAt ?? null })),
           };
           if ((!d.locations || !d.locations.length) || (!d.users || !d.users.length) || !d.numberSettings) this.write(result);
           return result;
@@ -646,6 +661,23 @@ export class LocalStore {
     };
     this.write({ ...data, locations: [l, ...data.locations] });
     return l;
+  }
+
+  createLpoSoMapping(form: { customerName: string; project: string; poNo: string; soRef: string }): LpoSoMapping {
+    const data = this.read();
+    const m: LpoSoMapping = {
+      id: nanoid(),
+      customerName: form.customerName,
+      project: form.project,
+      poNo: form.poNo,
+      soRef: form.soRef,
+      createdBy: this.auth?.name || 'Admin',
+      createdAt: today(),
+      modifiedBy: null,
+      modifiedAt: null,
+    };
+    this.write({ ...data, lpoSoMappings: [m, ...data.lpoSoMappings] });
+    return m;
   }
 
   createUserAccount(form: { username: string; password: string; role: 'admin' | 'garden' }): UserAccount {

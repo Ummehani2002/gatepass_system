@@ -32,18 +32,24 @@ input::placeholder { color: #a7b0aa; }
 
 @media print {
   [data-print-hide] { display: none !important; }
-  [data-print-doc]  { box-shadow: none !important; border: none !important; margin: 0 !important; }
+  [data-print-doc]  { box-shadow: none !important; border: none !important; margin: 0 !important; max-width: none !important; }
   [data-print-doc] input { border: none !important; padding: 0 !important; background: transparent !important; }
   [data-app-bg]     { background: #fff !important; }
   body              { background: #fff !important; }
   .print-only       { display: block !important; }
+  /* The @page margin below already provides page whitespace — stacking the
+     app's own screen-layout padding on top of it was squeezing the printable
+     width under the real page width, wrapping text onto extra lines and
+     pushing the two copies onto a second page. */
+  .gp-main          { padding: 0 !important; }
+  .gp-shell-row     { display: block !important; }
 }
 
 /* ── Responsive shell (mobile / narrow-screen layout) ──────────────────────
    The app is a single fixed sidebar + main-content shell; these rules let it
    collapse to a phone-friendly layout — horizontal scrollable nav pills on
    top, full-width content below — without touching desktop styling. */
-@media (max-width: 860px) {
+@media screen and (max-width: 860px) {
   .gp-header { padding: 0 12px !important; gap: 8px !important; }
   .gp-header-subtitle { display: none; }
   .gp-header-name { display: none; }

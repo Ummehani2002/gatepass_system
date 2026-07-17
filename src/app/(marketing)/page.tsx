@@ -5,7 +5,7 @@ import { createPortal } from 'react-dom';
 import * as XLSX from 'xlsx';
 import QRCode from 'qrcode';
 import { LocalStore, today, specOf } from '@/lib/gate-pass-store';
-import type { DeliveryNote, DNLine, GatePass, Customer, PlantMaster, LocationMaster, UserAccount, NumberSettings } from '@/lib/gate-pass-store';
+import type { DeliveryNote, DNLine, GatePass, Customer, PlantMaster, LocationMaster, UserAccount, NumberSettings, LpoSoMapping } from '@/lib/gate-pass-store';
 
 // ── Store singleton ───────────────────────────────────────────────────────────
 let _store: LocalStore | null = null;
@@ -221,7 +221,8 @@ function ProjectCombo({ value, options, onChangeText, onSelect }: {
 }) {
   const [open, setOpen] = useState(false);
   const q = (value || '').trim().toLowerCase();
-  const filtered = q ? options.filter(p => p.toLowerCase().includes(q)) : options;
+  const uniqueOptions = Array.from(new Set(options));
+  const filtered = q ? uniqueOptions.filter(p => p.toLowerCase().includes(q)) : uniqueOptions;
   return (
     <div style={{ position: 'relative' }}>
       <Inp
@@ -519,6 +520,12 @@ function emptyPlantForm(): PlantForm {
 interface LocationForm { name: string; }
 function emptyLocationForm(): LocationForm {
   return { name: '' };
+}
+
+// ── LPO / SO Mapping form state ─────────────────────────────────────────────────
+interface LpoSoForm { customerName: string; project: string; poNo: string; soRef: string; }
+function emptyLpoSoForm(): LpoSoForm {
+  return { customerName: '', project: '', poNo: '', soRef: '' };
 }
 
 // ── User Account form state ─────────────────────────────────────────────────────
@@ -827,6 +834,7 @@ type ViewKey =
   | 'admin_locations' | 'admin_new_location'
   | 'admin_users' | 'admin_new_user' | 'admin_reset_password'
   | 'admin_number_settings'
+  | 'admin_lposo' | 'admin_new_lposo'
   | 'report'
   | 'garden_home' | 'garden_scanning' | 'garden_new_dn' | 'garden_scan' | 'garden_view_dn';
 
@@ -847,6 +855,7 @@ export default function GatePassApp() {
   const [locations, setLocations] = useState<LocationMaster[]>([]);
   const [users, setUsers] = useState<UserAccount[]>([]);
   const [numberSettings, setNumberSettings] = useState<NumberSettings>({ gpPrefix: 'GP-', gpNext: 100001, dnPrefix: 'DO-', dnNext: 100001 });
+  const [lpoSoMappings, setLpoSoMappings] = useState<LpoSoMapping[]>([]);
 
   // ── Navigation targets ──
   const [activeGpNo, setActiveGpNo] = useState<string | null>(null);
@@ -863,6 +872,7 @@ export default function GatePassApp() {
   const [editingCustomerId, setEditingCustomerId] = useState<string | null>(null);
   const [plantForm, setPlantForm] = useState<PlantForm>(emptyPlantForm);
   const [locationForm, setLocationForm] = useState<LocationForm>(emptyLocationForm);
+  const [lpoSoForm, setLpoSoForm] = useState<LpoSoForm>(emptyLpoSoForm);
   const [userForm, setUserForm] = useState<UserForm>(emptyUserForm);
   const [resetPasswordUserId, setResetPasswordUserId] = useState<string | null>(null);
   const [resetPasswordValue, setResetPasswordValue] = useState('');
@@ -907,6 +917,7 @@ export default function GatePassApp() {
     setLocations(d.locations);
     setUsers(d.users);
     setNumberSettings(d.numberSettings);
+    setLpoSoMappings(d.lpoSoMappings);
   };
 
   const activeGp = gps.find(g => g.no === activeGpNo) || null;
@@ -915,7 +926,7 @@ export default function GatePassApp() {
 
   // ── Stats ──
   const kPending = gps.filter(g => !g.dnNo).length;
-  const kSerials = dns.reduce((a, d) => a + d.lines.reduce((b, l) => b + l.serials.length, 0), 0);
+  const kOpen = dns.filter(d => d.lines.some(l => lineStatus(l.postedQty, l.deliveryQty, l.hasSplit) === 'Open')).length;
 
   // ── Auth handlers ──
   const signIn = () => {
@@ -1106,7 +1117,7 @@ export default function GatePassApp() {
 
   const saveCustomer = () => {
     if (!customerForm.customerName.trim()) { setToast('Customer name is required'); return; }
-    const validProjects = customerForm.projects.map(p => p.value.trim()).filter(Boolean);
+    const validProjects = Array.from(new Set(customerForm.projects.map(p => p.value.trim()).filter(Boolean)));
     if (!validProjects.length) { setToast('At least one project is required'); return; }
     try {
       if (editingCustomerId) {
@@ -1194,6 +1205,25 @@ export default function GatePassApp() {
       reload();
       setToast('Location saved');
       setView('admin_locations');
+    } catch (e) { setToast((e as Error).message); }
+  };
+
+  // ── LPO / SO Mapping form handlers ──
+  const openNewLpoSo = () => {
+    setLpoSoForm(emptyLpoSoForm());
+    setView('admin_new_lposo');
+  };
+
+  const updateLpoSoField = (k: keyof LpoSoForm, v: string) =>
+    setLpoSoForm(f => ({ ...f, [k]: v }));
+
+  const saveLpoSo = () => {
+    if (!lpoSoForm.customerName.trim()) { setToast('Customer name is required'); return; }
+    try {
+      getStore().createLpoSoMapping(lpoSoForm);
+      reload();
+      setToast('LPO / SO mapping saved');
+      setView('admin_lposo');
     } catch (e) { setToast((e as Error).message); }
   };
 
@@ -1442,6 +1472,7 @@ export default function GatePassApp() {
     'admin_locations', 'admin_new_location',
     'admin_users', 'admin_new_user', 'admin_reset_password',
     'admin_number_settings',
+    'admin_lposo', 'admin_new_lposo',
   ]);
   const gardenNav: NavDef[] = [
     { label: 'My Tasks',        view: 'garden_home' },
@@ -1580,7 +1611,7 @@ export default function GatePassApp() {
                   { label: 'Gate Passes', value: gps.length, color: C.header },
                   { label: 'Awaiting Delivery Note', value: kPending, color: C.amber },
                   { label: 'Delivery Notes', value: dns.length, color: C.header },
-                  { label: 'Barcodes Linked', value: kSerials, color: C.primary },
+                  { label: 'Open Status', value: kOpen, color: C.amber },
                 ].map(s => (
                   <div key={s.label} style={{ background: C.white, border: `1px solid ${C.border}`, borderRadius: 12, padding: 17 }}>
                     <div style={{ fontSize: 12, fontWeight: 600, color: C.muted }}>{s.label}</div>
@@ -2038,6 +2069,11 @@ export default function GatePassApp() {
                   description="Control Gate Pass & Delivery Note numbering"
                   onClick={() => setView('admin_number_settings')}
                 />
+                <SettingsCard
+                  label="LPO / SO Mapping"
+                  description={`${lpoSoMappings.length} mapping${lpoSoMappings.length === 1 ? '' : 's'} on file`}
+                  onClick={() => setView('admin_lposo')}
+                />
               </div>
             </div>
           )}
@@ -2360,6 +2396,85 @@ export default function GatePassApp() {
               <p style={{ maxWidth: 560, marginTop: 14, fontSize: 12.5, color: '#9aa39d' }}>
                 Applies to newly created Gate Passes and Delivery Notes going forward — existing document numbers are unchanged. Each save advances by one automatically as new documents are created.
               </p>
+            </div>
+          )}
+
+          {/* ── ADMIN: LPO / SO MAPPING LIST ── */}
+          {view === 'admin_lposo' && (
+            <div>
+              <button onClick={() => setView('admin_settings')} style={{ background: 'none', border: 'none', color: '#5b6660', fontWeight: 600, fontSize: 13.5, cursor: 'pointer', marginBottom: 12, fontFamily: 'inherit' }}>← Back to Settings</button>
+              <div style={{ display: 'flex', alignItems: 'flex-end', justifyContent: 'space-between', marginBottom: 20 }}>
+                <div>
+                  <h1 style={{ fontFamily: 'var(--font-spectral),serif', fontWeight: 600, fontSize: 26, margin: 0 }}>LPO / SO Mapping</h1>
+                  <p style={{ margin: '4px 0 0', color: '#5b6660', fontSize: 14 }}>Customer / Project reference for PO &amp; SO numbers</p>
+                </div>
+                <Btn onClick={openNewLpoSo} style={{ background: C.primary, color: C.white, border: 'none', borderRadius: 9, padding: '11px 18px', fontSize: 14, fontWeight: 700, cursor: 'pointer' }} hov={{ background: C.ph }}>
+                  + New Mapping
+                </Btn>
+              </div>
+              <div style={{ background: C.white, border: `1px solid ${C.border}`, borderRadius: 12, overflow: 'hidden' }}>
+                <table style={{ width: '100%', borderCollapse: 'collapse' }}>
+                  <thead>
+                    <tr style={{ background: '#f6f8f6' }}>
+                      {['Customer Name', 'Project', 'PO No.', 'SO Ref.', 'Created By', 'Date', 'Last Modified'].map(h => <Th key={h}>{h}</Th>)}
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {lpoSoMappings.map(m => (
+                      <tr key={m.id} style={{ borderTop: `1px solid #eef1ee` }}>
+                        <td style={{ padding: '13px 16px', fontWeight: 600, fontSize: 14 }}>{m.customerName}</td>
+                        <td style={{ padding: '13px 16px', fontSize: 13.5, color: '#46514a' }}>{m.project || '—'}</td>
+                        <td style={{ padding: '13px 16px', fontSize: 13.5, color: '#46514a' }}>{m.poNo || '—'}</td>
+                        <td style={{ padding: '13px 16px', fontSize: 13.5, color: '#46514a' }}>{m.soRef || '—'}</td>
+                        <td style={{ padding: '13px 16px', fontSize: 13.5, color: '#46514a' }}>{m.createdBy}</td>
+                        <td style={{ padding: '13px 16px', fontSize: 13.5, color: '#46514a' }}>{m.createdAt}</td>
+                        <td style={{ padding: '13px 16px' }}><LastModified by={m.modifiedBy} at={m.modifiedAt} /></td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+                {lpoSoMappings.length === 0 && <Empty text="No LPO / SO mappings yet." />}
+              </div>
+            </div>
+          )}
+
+          {/* ── ADMIN: NEW LPO / SO MAPPING ── */}
+          {view === 'admin_new_lposo' && (
+            <div>
+              <button onClick={() => setView('admin_lposo')} style={{ background: 'none', border: 'none', color: '#5b6660', fontWeight: 600, fontSize: 13.5, cursor: 'pointer', marginBottom: 12, fontFamily: 'inherit' }}>← Cancel</button>
+              <div style={{ background: C.white, border: `1px solid ${C.border}`, borderRadius: 14, maxWidth: 560, overflow: 'hidden' }}>
+                <div style={{ padding: '20px 24px', borderBottom: `1px solid ${C.borderL}` }}>
+                  <h1 style={{ fontFamily: 'var(--font-spectral),serif', fontWeight: 600, fontSize: 22, margin: 0 }}>New LPO / SO Mapping</h1>
+                </div>
+                <div style={{ padding: '22px 24px' }}>
+                  <div>
+                    <FieldLabel>Customer Name *</FieldLabel>
+                    <Inp value={lpoSoForm.customerName} onChange={v => updateLpoSoField('customerName', v)} placeholder="e.g. Opal Garden" />
+                  </div>
+                  <div style={{ marginTop: 16 }}>
+                    <FieldLabel>Project</FieldLabel>
+                    <Inp value={lpoSoForm.project} onChange={v => updateLpoSoField('project', v)} placeholder="optional" />
+                  </div>
+                  <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 16, marginTop: 16 }}>
+                    <div>
+                      <FieldLabel>PO No.</FieldLabel>
+                      <Inp value={lpoSoForm.poNo} onChange={v => updateLpoSoField('poNo', v)} placeholder="optional" />
+                    </div>
+                    <div>
+                      <FieldLabel>SO Reference</FieldLabel>
+                      <Inp value={lpoSoForm.soRef} onChange={v => updateLpoSoField('soRef', v)} placeholder="optional" />
+                    </div>
+                  </div>
+                  <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 10, marginTop: 20 }}>
+                    <Btn onClick={() => setView('admin_lposo')} style={{ background: C.white, border: `1px solid #cfd8d2`, color: '#46514a', borderRadius: 9, padding: '11px 20px', fontSize: 14, fontWeight: 600, cursor: 'pointer' }}>
+                      Cancel
+                    </Btn>
+                    <Btn onClick={saveLpoSo} style={{ background: C.primary, color: C.white, border: 'none', borderRadius: 9, padding: '11px 22px', fontSize: 14, fontWeight: 700, cursor: 'pointer' }} hov={{ background: C.ph }}>
+                      Save Mapping
+                    </Btn>
+                  </div>
+                </div>
+              </div>
             </div>
           )}
 
