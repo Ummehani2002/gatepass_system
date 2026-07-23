@@ -79,13 +79,16 @@ See [ARCHITECTURE.md § File Structure](./ARCHITECTURE.md#2-file-structure).
 
 ## Deploying
 
-See **[DEPLOY.md](./DEPLOY.md)** for the free production setup (Neon Postgres + Render API + Vercel UI) with shared database.
+**AWS (recommended for this repo):** see **[DEPLOY-AWS.md](./DEPLOY-AWS.md)** — EC2 + Docker (UI + API), Postgres on Neon/RDS.
 
-Quick summary:
+**Free tier (no AWS):** see **[DEPLOY.md](./DEPLOY.md)** — Neon + Render + Vercel.
 
-1. Neon → create DB, run `gatepass-backend` `db:setup` + `db:seed`
-2. Render → deploy `gatepass-backend` with `DATABASE_URL`, `JWT_SECRET`, `CORS_ORIGIN`
-3. Vercel → deploy frontend with `NEXT_PUBLIC_API_URL` pointing at the Render API
+AWS quick summary:
+
+1. Neon → `db:setup` + `db:seed` (if not done)
+2. Launch EC2 (Amazon Linux), install Docker
+3. Clone repo, copy `.env.aws.example` → `.env.aws`, fill Neon URL + public IP URLs
+4. `docker compose -f docker-compose.aws.yml --env-file .env.aws up -d --build`
 
 For local demo without a database, leave `NEXT_PUBLIC_API_URL` empty (browser `localStorage` mode).
 

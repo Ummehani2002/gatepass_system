@@ -1,5 +1,7 @@
 # Deploy Gate Pass with shared Postgres (free)
 
+> Prefer AWS? Use **[DEPLOY-AWS.md](./DEPLOY-AWS.md)** (EC2 + Docker).
+
 This app has two parts:
 
 1. **Frontend** (Next.js) — deploy on [Vercel](https://vercel.com)
