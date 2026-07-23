@@ -24,23 +24,25 @@ input::placeholder { color: #a7b0aa; }
   margin: 10mm;
 }
 
-/* Hidden on screen, shown only in the browser's print output — used for the
-   second (lower-half) copy of the Delivery Note so printing produces the same
-   upper+lower duplicate layout as the PDF export, without showing two copies
-   on screen. */
-.print-only { display: none; }
+/* Named page used only by the Delivery Note (its table is wide — many columns) —
+   assigning an element `page: dn-landscape` switches it to this page's size for
+   both the browser Print dialog and print-to-PDF. */
+@page dn-landscape {
+  size: A4 landscape;
+  margin: 10mm;
+}
+.dn-print-landscape { page: dn-landscape; }
+
 
 @media print {
   [data-print-hide] { display: none !important; }
   [data-print-doc]  { box-shadow: none !important; border: none !important; margin: 0 !important; max-width: none !important; }
   [data-print-doc] input { border: none !important; padding: 0 !important; background: transparent !important; }
-  [data-app-bg]     { background: #fff !important; }
+  [data-app-bg]     { background: #fff !important; min-height: 0 !important; }
   body              { background: #fff !important; }
-  .print-only       { display: block !important; }
-  /* The @page margin below already provides page whitespace — stacking the
+  /* The @page margin above already provides page whitespace — stacking the
      app's own screen-layout padding on top of it was squeezing the printable
-     width under the real page width, wrapping text onto extra lines and
-     pushing the two copies onto a second page. */
+     width under the real page width and wrapping text onto extra lines. */
   .gp-main          { padding: 0 !important; }
   .gp-shell-row     { display: block !important; }
 }

@@ -5,7 +5,7 @@ import { createPortal } from 'react-dom';
 import * as XLSX from 'xlsx';
 import QRCode from 'qrcode';
 import { createStore, today, specOf } from '@/lib/gate-pass-store';
-import type { DeliveryNote, DNLine, GatePass, Customer, PlantMaster, LocationMaster, UserAccount, NumberSettings, LpoSoMapping, DataStore } from '@/lib/gate-pass-store';
+import type { DeliveryNote, DNLine, GatePass, Customer, PlantMaster, LocationMaster, UserAccount, NumberSettings, LpoSoMapping, DataStore, DNAttachment, ReprintLog, PlantTag, OnhandItem } from '@/lib/gate-pass-store';
 
 // ── Store singleton ───────────────────────────────────────────────────────────
 let _store: DataStore | null = null;
@@ -37,9 +37,7 @@ function Logo({ style }: { style?: React.CSSProperties }) {
 
 // ── QR Code ───────────────────────────────────────────────────────────────────
 // Drawn in useLayoutEffect (not a dynamic import) so the canvas has real
-// pixels as soon as possible after mount — PDF export clones this element
-// shortly after, and a still-pending draw would clone a blank canvas (see
-// copyCanvasBitmaps in buildDeliveryNotePdf).
+// pixels as soon as possible after mount, well before any PDF/print capture.
 function QrCode({ value, size = 60, color = '#9aa39d' }: { value: string; size?: number; color?: string }) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   useLayoutEffect(() => {
@@ -545,9 +543,11 @@ interface ReportRow {
 }
 
 type LineStatus = 'Closed' | 'Open' | 'Pending';
-function lineStatus(postedQty: string, deliveryQty: number, hasSplit: boolean): LineStatus {
-  if ((Number(postedQty) || 0) >= deliveryQty) return 'Closed';
-  return hasSplit ? 'Pending' : 'Open';
+function lineStatus(postedQty: string, deliveryQty: number): LineStatus {
+  const posted = Number(postedQty) || 0;
+  if (posted >= deliveryQty) return 'Closed';
+  if (posted > 0) return 'Pending';
+  return 'Open';
 }
 function statusColors(status: LineStatus): { background: string; color: string } {
   if (status === 'Closed') return { background: '#e0f0e8', color: C.primary };
@@ -560,6 +560,57 @@ function statusColors(status: LineStatus): { background: string; color: string }
 function dmyToIso(s: string): string {
   const m = s.match(/^(\d{2})-(\d{2})-(\d{4})$/);
   return m ? `${m[3]}-${m[2]}-${m[1]}` : '';
+}
+
+// ── Delivery Note attachments (Photo / Excel / PDF reference files) ───────────
+const MAX_ATTACHMENT_BYTES = 5 * 1024 * 1024; // 5MB — localStorage has limited total quota
+
+function readFileAsDataUrl(file: File): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(reader.result as string);
+    reader.onerror = () => reject(reader.error || new Error('Failed to read file'));
+    reader.readAsDataURL(file);
+  });
+}
+
+function formatBytes(bytes: number): string {
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+}
+
+function downloadDataUrl(dataUrl: string, filename: string) {
+  const a = document.createElement('a');
+  a.href = dataUrl; a.download = filename; a.click();
+}
+
+// Some existing external QR codes/labels encode a full lookup URL like
+//   http://acaciallc.dyndns.org/index.php?s=TRETERMAN~S000463462~OT_5B_150LP
+// where the middle "~"-separated segment is the actual serial/code wanted.
+// Scan fields run raw scanner input through this so pasting/typing a plain
+// code (not a URL) still passes through unchanged.
+function extractScanCode(raw: string): string {
+  const trimmed = raw.trim();
+  // The serial shows up in several raw shapes depending on the scanner/QR:
+  //   - wrapped in a lookup URL:      ?s=TRETERMAN~S000463462~OT_5B_150LP
+  //   - "~"-separated, no URL:        S000036722~PL_5_240LP
+  //   - concatenated with no gap at all (tildes dropped in transit):
+  //                                   TREPLUOBS000036722PL_5_240LP
+  // In every case the serial itself looks like "S" followed by exactly 9
+  // digits — matched as a FIXED length (not "6 or more") because when there's
+  // no separator between the serial and the next segment (e.g. a size code
+  // starting with digits, "...S000036722" immediately followed by "5240..."),
+  // an open-ended digit run greedily swallows the next segment's digits too.
+  const urlMatch = trimmed.match(/[?&]s=([^&]+)/i);
+  const candidate = urlMatch?.[1] ? decodeURIComponent(urlMatch[1]) : trimmed;
+  const embedded = candidate.match(/S\d{9}/i);
+  if (embedded) return embedded[0];
+  if (candidate.includes('~')) {
+    const first = candidate.split('~').map(p => p.trim()).find(Boolean);
+    if (first) return first;
+  }
+  return trimmed;
 }
 
 // One row per physical unit (not per line) — Plant Name/Specification copied down
@@ -586,7 +637,7 @@ function exportDnScanSheet(dn: DeliveryNote) {
 }
 
 // ── Shared PDF export / share-sheet logic (Delivery Note + Gate Pass) ──────────
-async function buildPdfFromElement(el: HTMLElement) {
+async function buildPdfFromElement(el: HTMLElement, orientation: 'portrait' | 'landscape' = 'portrait') {
   const [{ default: html2canvas }, { jsPDF }] = await Promise.all([
     import('html2canvas'),
     import('jspdf'),
@@ -596,7 +647,7 @@ async function buildPdfFromElement(el: HTMLElement) {
     ignoreElements: e => e.hasAttribute('data-print-hide'),
   });
   const imgData = canvas.toDataURL('image/png');
-  const pdf = new jsPDF({ orientation: 'portrait', unit: 'pt', format: 'a4' });
+  const pdf = new jsPDF({ orientation, unit: 'pt', format: 'a4' });
   const pageWidth = pdf.internal.pageSize.getWidth();
   const pageHeight = pdf.internal.pageSize.getHeight();
   const imgWidth = pageWidth;
@@ -614,89 +665,136 @@ async function buildPdfFromElement(el: HTMLElement) {
   return pdf;
 }
 
-// Builds the Delivery Note PDF as one or more A4 pages, each carrying two
-// stacked copies of the same content (upper + lower half, cut line between)
-// so a page can be torn in two. Line-item rows are capped at 5 per page —
-// once a note has more than 5 lines, row 6 onward spills onto page 2 (and
-// so on), rather than shrinking everything to fit one page. The duplication
-// and chunking are assembled in a detached, off-screen clone so the live
-// screen DOM and browser Print dialog are untouched (still single-copy,
-// all lines together).
-const DN_PDF_ROWS_PER_PAGE = 5;
+// cloneNode(true) copies a <canvas> element but not its drawn pixels (the
+// bitmap lives outside the DOM tree), so anything drawn on a canvas — like
+// the QR code — comes out blank in a clone unless it's re-painted here.
+function copyCanvasBitmaps(source: HTMLElement, target: HTMLElement) {
+  const sourceCanvases = source.querySelectorAll('canvas');
+  const targetCanvases = target.querySelectorAll('canvas');
+  sourceCanvases.forEach((sourceCanvas, i) => {
+    const targetCanvas = targetCanvases[i];
+    if (!targetCanvas) return;
+    targetCanvas.getContext('2d')?.drawImage(sourceCanvas, 0, 0);
+  });
+}
 
-async function buildDeliveryNotePdf(el: HTMLElement) {
+// Builds the Delivery Note PDF with the header (everything before the table —
+// Acacia LLC through PO No.) repeated at the top of every page, the footer
+// (Prepared By through the Note line) placed once at the true end of the
+// document, and the line-items table as the only part that flows/paginates
+// across pages in between. Falls back to the simple whole-element capture if
+// there's no table or no rows to paginate.
+async function buildDeliveryNotePdf(el: HTMLElement, orientation: 'portrait' | 'landscape') {
   const [{ default: html2canvas }, { jsPDF }] = await Promise.all([
     import('html2canvas'),
     import('jspdf'),
   ]);
 
-  const sourceTbody = el.querySelector('table tbody');
-  const rows = sourceTbody ? Array.from(sourceTbody.children) : [];
-  const chunks: Element[][] = [];
-  for (let i = 0; i < rows.length; i += DN_PDF_ROWS_PER_PAGE) {
-    chunks.push(rows.slice(i, i + DN_PDF_ROWS_PER_PAGE));
+  const pdf = new jsPDF({ orientation, unit: 'pt', format: 'a4' });
+  const pageWidthPt = pdf.internal.pageSize.getWidth();
+  const pageHeightPt = pdf.internal.pageSize.getHeight();
+
+  const addCanvasAsPage = (canvas: HTMLCanvasElement, isFirst: boolean) => {
+    const imgData = canvas.toDataURL('image/png');
+    const imgWidth = pageWidthPt;
+    const imgHeight = (canvas.height * imgWidth) / canvas.width;
+    if (!isFirst) pdf.addPage();
+    pdf.addImage(imgData, 'PNG', 0, 0, imgWidth, Math.min(imgHeight, pageHeightPt));
+  };
+
+  const capture = (target: HTMLElement) => html2canvas(target, {
+    scale: 2, backgroundColor: '#ffffff',
+    ignoreElements: e => e.hasAttribute('data-print-hide'),
+  });
+
+  const table = el.querySelector('table');
+  const children = Array.from(el.children) as HTMLElement[];
+  const tableIndex = table ? children.indexOf(table) : -1;
+  const tbody = table?.querySelector('tbody');
+  const rows = tbody ? (Array.from(tbody.children) as HTMLElement[]) : [];
+
+  if (!table || tableIndex === -1 || rows.length === 0) {
+    const canvas = await capture(el);
+    addCanvasAsPage(canvas, true);
+    return pdf;
   }
-  if (chunks.length === 0) chunks.push([]);
 
-  // cloneNode(true) copies a <canvas> element but not its drawn pixels (the
-  // bitmap lives outside the DOM tree), so anything drawn on a canvas — like
-  // the barcode — comes out blank in the clone unless it's re-painted here.
-  const copyCanvasBitmaps = (source: HTMLElement, target: HTMLElement) => {
-    const sourceCanvases = source.querySelectorAll('canvas');
-    const targetCanvases = target.querySelectorAll('canvas');
-    sourceCanvases.forEach((sourceCanvas, i) => {
-      const targetCanvas = targetCanvases[i];
-      if (!targetCanvas) return;
-      targetCanvas.getContext('2d')?.drawImage(sourceCanvas, 0, 0);
-    });
-  };
+  const headerNodes = children.slice(0, tableIndex);
+  const footerNodes = children.slice(tableIndex + 1).filter(c => !c.hasAttribute('data-print-hide'));
+  const thead = table.querySelector('thead') as HTMLElement | null;
 
-  const makeCopy = (chunkRows: Element[]) => {
-    const copy = el.cloneNode(true) as HTMLElement;
-    copyCanvasBitmaps(el, copy);
-    const tbody = copy.querySelector('table tbody');
-    if (tbody) {
-      tbody.innerHTML = '';
-      chunkRows.forEach(r => tbody.appendChild(r.cloneNode(true)));
+  const ptPerPx = pageWidthPt / el.offsetWidth;
+  const maxPagePx = pageHeightPt / ptPerPx;
+  const headerPx = headerNodes.reduce((a, n) => a + n.offsetHeight, 0);
+  const footerPx = footerNodes.reduce((a, n) => a + n.offsetHeight, 0);
+  const theadPx = thead?.offsetHeight || 0;
+
+  // Greedily pack rows into pages, leaving room for header + thead (the
+  // footer is intentionally excluded from this budget — it only needs to fit
+  // on the true last page, handled below).
+  const rowBudgetPx = Math.max(100, maxPagePx - headerPx - theadPx - 20);
+  const pages: HTMLElement[][] = [];
+  let current: HTMLElement[] = [];
+  let currentHeight = 0;
+  for (const row of rows) {
+    const h = row.offsetHeight;
+    if (current.length > 0 && currentHeight + h > rowBudgetPx) {
+      pages.push(current);
+      current = [];
+      currentHeight = 0;
     }
-    return copy;
-  };
+    current.push(row);
+    currentHeight += h;
+  }
+  if (current.length > 0) pages.push(current);
+  if (pages.length === 0) pages.push([]);
 
-  const buildPageWrapper = (chunkRows: Element[]) => {
+  // If the footer doesn't fit alongside the last page's rows, bump the
+  // overflowing rows onto a fresh final page so the footer never gets cut off.
+  const lastPageRows = pages[pages.length - 1];
+  if (lastPageRows) {
+    let lastPageRowsHeight = lastPageRows.reduce((a, r) => a + r.offsetHeight, 0);
+    if (headerPx + theadPx + lastPageRowsHeight + footerPx > maxPagePx) {
+      const moved: HTMLElement[] = [];
+      while (lastPageRows.length > 0 && headerPx + theadPx + lastPageRowsHeight + footerPx > maxPagePx) {
+        const popped = lastPageRows.pop();
+        if (!popped) break;
+        moved.unshift(popped);
+        lastPageRowsHeight -= popped.offsetHeight;
+      }
+      if (moved.length > 0) pages.push(moved);
+    }
+  }
+
+  for (let i = 0; i < pages.length; i++) {
+    const pageRows = pages[i] ?? [];
+    const isLast = i === pages.length - 1;
+
     const wrapper = document.createElement('div');
     wrapper.style.cssText = `position:fixed; left:-10000px; top:0; background:#fff; width:${el.offsetWidth}px;`;
 
-    const cutLine = document.createElement('div');
-    cutLine.style.cssText = 'position:relative; border-top:1px dashed #9aa39d; margin:24px 0 0; padding-top:14px;';
-    const cutLabel = document.createElement('span');
-    cutLabel.textContent = '✂ cut here';
-    cutLabel.style.cssText = 'position:absolute; left:50%; top:-8px; transform:translateX(-50%); background:#fff; padding:0 10px; font-size:11px; color:#9aa39d; letter-spacing:.04em;';
-    cutLine.appendChild(cutLabel);
+    headerNodes.forEach(n => {
+      const clone = n.cloneNode(true) as HTMLElement;
+      copyCanvasBitmaps(n, clone);
+      wrapper.appendChild(clone);
+    });
 
-    wrapper.appendChild(makeCopy(chunkRows));
-    wrapper.appendChild(cutLine);
-    wrapper.appendChild(makeCopy(chunkRows));
-    return wrapper;
-  };
+    const tableClone = table.cloneNode(true) as HTMLTableElement;
+    const tbodyClone = tableClone.querySelector('tbody');
+    if (tbodyClone) {
+      tbodyClone.innerHTML = '';
+      pageRows.forEach(r => tbodyClone.appendChild(r.cloneNode(true)));
+    }
+    wrapper.appendChild(tableClone);
 
-  const pdf = new jsPDF({ orientation: 'portrait', unit: 'pt', format: 'a4' });
-  const pageWidth = pdf.internal.pageSize.getWidth();
-  const pageHeight = pdf.internal.pageSize.getHeight();
+    if (isLast) {
+      footerNodes.forEach(n => wrapper.appendChild(n.cloneNode(true) as HTMLElement));
+    }
 
-  for (let i = 0; i < chunks.length; i++) {
-    const chunkRows = chunks[i] ?? [];
-    const wrapper = buildPageWrapper(chunkRows);
     document.body.appendChild(wrapper);
     try {
-      const canvas = await html2canvas(wrapper, {
-        scale: 2, backgroundColor: '#ffffff',
-        ignoreElements: e => e.hasAttribute('data-print-hide'),
-      });
-      const imgData = canvas.toDataURL('image/png');
-      const imgWidth = pageWidth;
-      const imgHeight = (canvas.height * imgWidth) / canvas.width;
-      if (i > 0) pdf.addPage();
-      pdf.addImage(imgData, 'PNG', 0, 0, imgWidth, Math.min(imgHeight, pageHeight));
+      const canvas = await capture(wrapper);
+      addCanvasAsPage(canvas, i === 0);
     } finally {
       document.body.removeChild(wrapper);
     }
@@ -712,14 +810,14 @@ function downloadFile(file: File) {
   URL.revokeObjectURL(url);
 }
 
-function usePdfShare(printRef: React.RefObject<HTMLElement | null>, options?: { doubleUp?: boolean }) {
+function usePdfShare(printRef: React.RefObject<HTMLElement | null>, options?: { orientation?: 'portrait' | 'landscape'; paginated?: boolean }) {
   const [downloading, setDownloading] = useState(false);
   const [shareMenuOpen, setShareMenuOpen] = useState(false);
   const [sharing, setSharing] = useState(false);
 
-  const buildPdf = () => options?.doubleUp
-    ? buildDeliveryNotePdf(printRef.current!)
-    : buildPdfFromElement(printRef.current!);
+  const buildPdf = () => options?.paginated
+    ? buildDeliveryNotePdf(printRef.current!, options?.orientation ?? 'portrait')
+    : buildPdfFromElement(printRef.current!, options?.orientation ?? 'portrait');
 
   const getPdfFile = async (filename: string) => {
     const pdf = await buildPdf();
@@ -835,6 +933,9 @@ type ViewKey =
   | 'admin_users' | 'admin_new_user' | 'admin_reset_password'
   | 'admin_number_settings'
   | 'admin_lposo' | 'admin_new_lposo'
+  | 'admin_reprints' | 'admin_new_reprint'
+  | 'admin_tags' | 'admin_new_tag'
+  | 'admin_onhand' | 'admin_new_onhand'
   | 'report'
   | 'garden_home' | 'garden_scanning' | 'garden_new_dn' | 'garden_scan' | 'garden_view_dn';
 
@@ -856,6 +957,10 @@ export default function GatePassApp() {
   const [users, setUsers] = useState<UserAccount[]>([]);
   const [numberSettings, setNumberSettings] = useState<NumberSettings>({ gpPrefix: 'GP-', gpNext: 100001, dnPrefix: 'DO-', dnNext: 100001 });
   const [lpoSoMappings, setLpoSoMappings] = useState<LpoSoMapping[]>([]);
+  const [reprintLogs, setReprintLogs] = useState<ReprintLog[]>([]);
+  const [plantTags, setPlantTags] = useState<PlantTag[]>([]);
+  const [onhandItems, setOnhandItems] = useState<OnhandItem[]>([]);
+  const [onhandSearch, setOnhandSearch] = useState('');
 
   // ── Navigation targets ──
   const [activeGpNo, setActiveGpNo] = useState<string | null>(null);
@@ -867,12 +972,22 @@ export default function GatePassApp() {
   const [gpForGardenDn, setGpForGardenDn] = useState(false);
   const gpPrintRef = useRef<HTMLDivElement>(null);
   const gpShare = usePdfShare(gpPrintRef);
+  const tagPrintRef = useRef<HTMLDivElement>(null);
   const [dnForm, setDnForm] = useState<DNForm | null>(null);
   const [customerForm, setCustomerForm] = useState<CustomerForm>(emptyCustomerForm);
   const [editingCustomerId, setEditingCustomerId] = useState<string | null>(null);
   const [plantForm, setPlantForm] = useState<PlantForm>(emptyPlantForm);
   const [locationForm, setLocationForm] = useState<LocationForm>(emptyLocationForm);
   const [lpoSoForm, setLpoSoForm] = useState<LpoSoForm>(emptyLpoSoForm);
+  const [reprintScanValue, setReprintScanValue] = useState('');
+  const [reprintMatch, setReprintMatch] = useState<{ type: 'gp' | 'dn'; no: string; customerProject: string; date: string; status: string } | null>(null);
+  const [reprintNotFound, setReprintNotFound] = useState(false);
+  const [tagForm, setTagForm] = useState({ srlNo: '', plantCode: '', plantName: '', size: '', location: '', warehouse: '' });
+  const [onhandForm, setOnhandForm] = useState({
+    style: '', itemNumber: '', itemName: '', searchName: '', size: '', color: '',
+    site: '', warehouse: '', location: '', physicalInventory: '', unitRate: '',
+  });
+  const [tagError, setTagError] = useState<string | null>(null);
   const [userForm, setUserForm] = useState<UserForm>(emptyUserForm);
   const [resetPasswordUserId, setResetPasswordUserId] = useState<string | null>(null);
   const [resetPasswordValue, setResetPasswordValue] = useState('');
@@ -880,6 +995,7 @@ export default function GatePassApp() {
   const [reportFilterGpNo, setReportFilterGpNo] = useState('');
   const [reportFilterDnNo, setReportFilterDnNo] = useState('');
   const [reportFilterCustomerProject, setReportFilterCustomerProject] = useState('');
+  const [reportFilterProject, setReportFilterProject] = useState('');
   const [reportFilterFromDate, setReportFilterFromDate] = useState('');
   const [reportFilterToDate, setReportFilterToDate] = useState('');
   const [reportFilterStatus, setReportFilterStatus] = useState('');
@@ -892,6 +1008,8 @@ export default function GatePassApp() {
   const [scanInput,     setScanInput]     = useState('');
   const [scanFeedback,  setScanFeedback]  = useState<{ msg: string; ok: boolean } | null>(null);
   const scanRef = useRef<HTMLInputElement | null>(null);
+  const reprintScanRef = useRef<HTMLInputElement | null>(null);
+  const tagScanRef = useRef<HTMLInputElement | null>(null);
 
   // ── Toast ──
   const [toast, setToast] = useState<string | null>(null);
@@ -899,6 +1017,8 @@ export default function GatePassApp() {
   // ── Side-effects ──
   useEffect(() => {
     if (view === 'garden_scan') setTimeout(() => scanRef.current?.focus(), 80);
+    if (view === 'admin_new_reprint') setTimeout(() => reprintScanRef.current?.focus(), 80);
+    if (view === 'admin_new_tag') setTimeout(() => tagScanRef.current?.focus(), 80);
   }, [view]);
 
   useEffect(() => {
@@ -918,6 +1038,9 @@ export default function GatePassApp() {
     setUsers(d.users);
     setNumberSettings(d.numberSettings);
     setLpoSoMappings(d.lpoSoMappings);
+    setReprintLogs(d.reprintLogs);
+    setPlantTags(d.plantTags);
+    setOnhandItems(d.onhandItems);
   };
 
   // Restore API/local session after refresh
@@ -949,7 +1072,7 @@ export default function GatePassApp() {
 
   // ── Stats ──
   const kPending = gps.filter(g => !g.dnNo).length;
-  const kOpen = dns.filter(d => d.lines.some(l => lineStatus(l.postedQty, l.deliveryQty, l.hasSplit) === 'Open')).length;
+  const kOpen = dns.filter(d => d.lines.some(l => lineStatus(l.postedQty, l.deliveryQty) === 'Open')).length;
 
   // ── Auth handlers ──
   const signIn = async () => {
@@ -1250,6 +1373,174 @@ export default function GatePassApp() {
     } catch (e) { setToast((e as Error).message); }
   };
 
+  // ── Reprint form handlers ──
+  const openNewReprint = () => {
+    setReprintScanValue('');
+    setReprintMatch(null);
+    setReprintNotFound(false);
+    setView('admin_new_reprint');
+  };
+
+  const handleReprintScan = (value: string) => {
+    setReprintScanValue(value);
+    setReprintNotFound(false);
+    setReprintMatch(null);
+  };
+
+  const submitReprintScan = () => {
+    const code = extractScanCode(reprintScanValue);
+    if (!code) return;
+    if (code !== reprintScanValue) setReprintScanValue(code);
+    const dn = dns.find(d => d.no.toLowerCase() === code.toLowerCase());
+    if (dn) {
+      setReprintMatch({ type: 'dn', no: dn.no, customerProject: dn.customerProject, date: dn.date, status: dn.status });
+      setReprintNotFound(false);
+      return;
+    }
+    const gp = gps.find(g => g.no.toLowerCase() === code.toLowerCase());
+    if (gp) {
+      setReprintMatch({ type: 'gp', no: gp.no, customerProject: gp.customerName, date: gp.doDate, status: gp.dnNo ? 'completed' : 'pending' });
+      setReprintNotFound(false);
+      return;
+    }
+    setReprintMatch(null);
+    setReprintNotFound(true);
+  };
+
+  const confirmReprint = async () => {
+    if (!reprintMatch) return;
+    try {
+      await getStore().createReprintLog({ docType: reprintMatch.type, docNo: reprintMatch.no, customerProject: reprintMatch.customerProject });
+      await reload();
+      if (reprintMatch.type === 'dn') {
+        setActiveDnNo(reprintMatch.no);
+        setView('admin_view_dn');
+      } else {
+        setActiveGpNo(reprintMatch.no);
+        setView('admin_view_gp');
+      }
+    } catch (e) { setToast((e as Error).message); }
+  };
+
+  // ── Tag Print form handlers (standalone — not tied to a Gate Pass or Delivery Note) ──
+  const openNewTag = () => {
+    setTagForm({ srlNo: '', plantCode: '', plantName: '', size: '', location: '', warehouse: '' });
+    setTagError(null);
+    setView('admin_new_tag');
+  };
+
+  const updateTagField = (k: keyof typeof tagForm, v: string) => {
+    setTagForm(f => ({ ...f, [k]: v }));
+    setTagError(null);
+  };
+
+  // Scanning the SRL# looks it up against Onhand (matching Style or Item Number)
+  // and auto-fills Plant Name / Plant Code / Size / Location / Warehouse from that record.
+  const handleTagSrlScan = (raw: string) => {
+    const srlNo = extractScanCode(raw);
+    const match = onhandItems.find(o => o.style === srlNo || o.itemNumber === srlNo);
+    setTagForm(f => ({
+      ...f,
+      srlNo,
+      plantName: match ? match.itemName : f.plantName,
+      plantCode: match ? match.itemNumber : f.plantCode,
+      size: match ? match.size : f.size,
+      location: match ? match.location : f.location,
+      warehouse: match ? match.warehouse : f.warehouse,
+    }));
+    setTagError(null);
+  };
+
+  const saveAndPrintTag = async () => {
+    if (!tagForm.srlNo.trim()) { setTagError('Scan or enter an SRL# first'); return; }
+    if (!tagForm.plantName.trim()) { setTagError('Plant Name is required'); return; }
+    try {
+      await getStore().createPlantTag(tagForm);
+      await reload();
+      setTimeout(() => window.print(), 80);
+    } catch (e) { setTagError((e as Error).message); }
+  };
+
+  // ── Onhand inventory handlers (standalone reference table, bulk-imported from an ERP export) ──
+  const onhandFileRef = useRef<HTMLInputElement | null>(null);
+
+  const handleOnhandExcelUpload = async (file: File) => {
+    try {
+      const buf = await file.arrayBuffer();
+      const wb = XLSX.read(buf, { type: 'array' });
+      const firstSheetName = wb.SheetNames[0];
+      if (!firstSheetName) { setToast('The Excel file has no sheets'); return; }
+      const sheet = wb.Sheets[firstSheetName];
+      if (!sheet) { setToast('The Excel file has no sheets'); return; }
+      const rows = XLSX.utils.sheet_to_json<Record<string, unknown>>(sheet, { defval: '' });
+
+      const findKey = (row: Record<string, unknown>, pattern: RegExp) =>
+        Object.keys(row).find(k => pattern.test(k.trim()));
+      const str = (row: Record<string, unknown>, key: string | undefined) => key ? String(row[key]).trim() : '';
+      const num = (row: Record<string, unknown>, key: string | undefined) => {
+        if (!key) return 0;
+        const n = Number(String(row[key]).replace(/,/g, '').trim());
+        return Number.isFinite(n) ? n : 0;
+      };
+
+      const parsed: Array<Omit<OnhandItem, 'id'>> = [];
+      for (const row of rows) {
+        const styleKey = findKey(row, /^style$/i);
+        const itemNumberKey = findKey(row, /^item\s*number$/i);
+        const itemNameKey = findKey(row, /^item\s*name$/i);
+        const searchNameKey = findKey(row, /^search\s*name$/i);
+        const sizeKey = findKey(row, /^size$/i);
+        const colorKey = findKey(row, /^color$/i);
+        const siteKey = findKey(row, /^site$/i);
+        const warehouseKey = findKey(row, /^warehouse$/i);
+        const locationKey = findKey(row, /^location$/i);
+        const physicalKey = findKey(row, /^physical\s*inventory$/i);
+        const rateKey = findKey(row, /^unit\s*rate$/i);
+        const itemNumber = str(row, itemNumberKey);
+        const itemName = str(row, itemNameKey);
+        if (!itemNumber && !itemName) continue;
+        parsed.push({
+          style: str(row, styleKey), itemNumber, itemName, searchName: str(row, searchNameKey),
+          size: str(row, sizeKey), color: str(row, colorKey), site: str(row, siteKey),
+          warehouse: str(row, warehouseKey), location: str(row, locationKey),
+          physicalInventory: num(row, physicalKey), unitRate: num(row, rateKey),
+        });
+      }
+
+      if (!parsed.length) {
+        setToast('No valid rows found — expected "Item Number" / "Item Name" columns');
+        return;
+      }
+      await getStore().replaceOnhandItems(parsed);
+      await reload();
+      setToast(`Imported ${parsed.length} onhand item${parsed.length === 1 ? '' : 's'} (replaced previous data)`);
+    } catch {
+      setToast('Could not read the Excel file');
+    }
+  };
+
+  const openNewOnhand = () => {
+    setOnhandForm({ style: '', itemNumber: '', itemName: '', searchName: '', size: '', color: '', site: '', warehouse: '', location: '', physicalInventory: '', unitRate: '' });
+    setView('admin_new_onhand');
+  };
+
+  const updateOnhandField = (k: keyof typeof onhandForm, v: string) =>
+    setOnhandForm(f => ({ ...f, [k]: v }));
+
+  const saveOnhandItem = async () => {
+    if (!onhandForm.itemNumber.trim() && !onhandForm.itemName.trim()) { setToast('Item Number or Item Name is required'); return; }
+    try {
+      await getStore().createOnhandItem({
+        ...onhandForm,
+        physicalInventory: Number(onhandForm.physicalInventory) || 0,
+        unitRate: Number(onhandForm.unitRate) || 0,
+      });
+      await reload();
+      setToast('Onhand item saved');
+      setView('admin_onhand');
+    } catch (e) { setToast((e as Error).message); }
+  };
+
   // ── User Account form handlers ──
   const openNewUser = () => {
     setUserForm(emptyUserForm());
@@ -1428,7 +1719,7 @@ export default function GatePassApp() {
         remainingQty: line.remainingQty,
         location: line.location,
         remarks: line.remarks,
-        status: lineStatus(line.postedQty, line.deliveryQty, line.hasSplit),
+        status: lineStatus(line.postedQty, line.deliveryQty),
       };
     });
   });
@@ -1437,6 +1728,7 @@ export default function GatePassApp() {
   const reportGpNoOptions = uniqueSorted(reportRows.map(r => r.gpNo));
   const reportDnNoOptions = uniqueSorted(reportRows.map(r => r.dnNo));
   const reportCustomerProjectOptions = uniqueSorted(reportRows.map(r => r.customerProject));
+  const reportProjectOptions = uniqueSorted(reportRows.map(r => r.project));
   const reportStatusOptions = uniqueSorted(reportRows.map(r => r.status));
 
   const filteredReportRows = reportRows.filter(r => {
@@ -1445,6 +1737,7 @@ export default function GatePassApp() {
       (!reportFilterGpNo || r.gpNo.toLowerCase().includes(reportFilterGpNo.trim().toLowerCase())) &&
       (!reportFilterDnNo || r.dnNo.toLowerCase().includes(reportFilterDnNo.trim().toLowerCase())) &&
       (!reportFilterCustomerProject || r.customerProject.toLowerCase().includes(reportFilterCustomerProject.trim().toLowerCase())) &&
+      (!reportFilterProject || r.project.toLowerCase().includes(reportFilterProject.trim().toLowerCase())) &&
       (!reportFilterFromDate || (!!rowIso && rowIso >= reportFilterFromDate)) &&
       (!reportFilterToDate || (!!rowIso && rowIso <= reportFilterToDate)) &&
       (!reportFilterStatus || r.status.toLowerCase() === reportFilterStatus.trim().toLowerCase())
@@ -1475,7 +1768,7 @@ export default function GatePassApp() {
     const ws = XLSX.utils.json_to_sheet(rows);
     const wb = XLSX.utils.book_new();
     XLSX.utils.book_append_sheet(wb, ws, 'Report');
-    const filterActive = !!(reportFilterGpNo || reportFilterDnNo || reportFilterCustomerProject || reportFilterFromDate || reportFilterToDate || reportFilterStatus);
+    const filterActive = !!(reportFilterGpNo || reportFilterDnNo || reportFilterCustomerProject || reportFilterProject || reportFilterFromDate || reportFilterToDate || reportFilterStatus);
     XLSX.writeFile(wb, `Report-${filterActive ? 'Filtered' : 'Full'}-${today()}.xlsx`);
   };
 
@@ -1486,6 +1779,9 @@ export default function GatePassApp() {
     { label: 'Gate Passes',     view: 'admin_gps' },
     { label: 'Delivery Notes',  view: 'admin_dns' },
     { label: 'Customers',       view: 'admin_customers' },
+    { label: 'Reprint',         view: 'admin_reprints' },
+    { label: 'Tag Print',       view: 'admin_tags' },
+    { label: 'Onhand',          view: 'admin_onhand' },
     { label: 'Settings',        view: 'admin_settings' },
     { label: 'Report',         view: 'report' },
   ];
@@ -1964,15 +2260,21 @@ export default function GatePassApp() {
                   await reload();
                 } catch (e) { setToast((e as Error).message); }
               }}
-              onSplitLine={async (dnNo, slNo) => {
-                try {
-                  await getStore().splitDeliveryNoteLine(dnNo, slNo);
-                  await reload();
-                } catch (e) { setToast((e as Error).message); }
-              }}
               onRemoveLine={async (dnNo, slNo) => {
                 try {
                   await getStore().removeDeliveryNoteLine(dnNo, slNo);
+                  await reload();
+                } catch (e) { setToast((e as Error).message); }
+              }}
+              onAddAttachment={async (dnNo, file) => {
+                try {
+                  await getStore().addDeliveryNoteAttachment(dnNo, file);
+                  await reload();
+                } catch (e) { setToast((e as Error).message); }
+              }}
+              onRemoveAttachment={async (dnNo, attachmentId) => {
+                try {
+                  await getStore().removeDeliveryNoteAttachment(dnNo, attachmentId);
                   await reload();
                 } catch (e) { setToast((e as Error).message); }
               }}
@@ -2501,6 +2803,347 @@ export default function GatePassApp() {
             </div>
           )}
 
+          {/* ── ADMIN: REPRINT LOG LIST ── */}
+          {view === 'admin_reprints' && (
+            <div>
+              <div style={{ display: 'flex', alignItems: 'flex-end', justifyContent: 'space-between', marginBottom: 20 }}>
+                <div>
+                  <h1 style={{ fontFamily: 'var(--font-spectral),serif', fontWeight: 600, fontSize: 26, margin: 0 }}>Reprint</h1>
+                  <p style={{ margin: '4px 0 0', color: '#5b6660', fontSize: 14 }}>Scan a Gate Pass or Delivery Note to reprint it</p>
+                </div>
+                <Btn onClick={openNewReprint} style={{ background: C.primary, color: C.white, border: 'none', borderRadius: 9, padding: '11px 18px', fontSize: 14, fontWeight: 700, cursor: 'pointer' }} hov={{ background: C.ph }}>
+                  + New Reprint
+                </Btn>
+              </div>
+              <div style={{ background: C.white, border: `1px solid ${C.border}`, borderRadius: 12, overflow: 'hidden' }}>
+                <table style={{ width: '100%', borderCollapse: 'collapse' }}>
+                  <thead>
+                    <tr style={{ background: '#f6f8f6' }}>
+                      {['Doc Type', 'Doc No.', 'Customer / Project', 'Reprinted By', 'Date'].map(h => <Th key={h}>{h}</Th>)}
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {reprintLogs.map(log => (
+                      <tr key={log.id} style={{ borderTop: `1px solid #eef1ee` }}>
+                        <td style={{ padding: '13px 16px', fontSize: 13.5 }}>{log.docType === 'gp' ? 'Gate Pass' : 'Delivery Note'}</td>
+                        <td style={{ padding: '13px 16px', fontWeight: 700, fontSize: 14 }}>{log.docNo}</td>
+                        <td style={{ padding: '13px 16px', fontSize: 13.5, color: '#46514a' }}>{log.customerProject}</td>
+                        <td style={{ padding: '13px 16px', fontSize: 13.5, color: '#46514a' }}>{log.createdBy}</td>
+                        <td style={{ padding: '13px 16px', fontSize: 13.5, color: '#46514a' }}>{log.createdAt}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+                {reprintLogs.length === 0 && <Empty text="No reprints logged yet." />}
+              </div>
+            </div>
+          )}
+
+          {/* ── ADMIN: NEW REPRINT (Scan) ── */}
+          {view === 'admin_new_reprint' && (
+            <div>
+              <button onClick={() => setView('admin_reprints')} style={{ background: 'none', border: 'none', color: '#5b6660', fontWeight: 600, fontSize: 13.5, cursor: 'pointer', marginBottom: 12, fontFamily: 'inherit' }}>← Cancel</button>
+              <div style={{ background: C.white, border: `1px solid ${C.border}`, borderRadius: 14, maxWidth: 560, overflow: 'hidden' }}>
+                <div style={{ padding: '20px 24px', borderBottom: `1px solid ${C.borderL}` }}>
+                  <h1 style={{ fontFamily: 'var(--font-spectral),serif', fontWeight: 600, fontSize: 22, margin: 0 }}>New Reprint</h1>
+                </div>
+                <div style={{ padding: '22px 24px' }}>
+                  <div>
+                    <FieldLabel>Scan Gate Pass / Delivery Note No. *</FieldLabel>
+                    <Inp
+                      value={reprintScanValue}
+                      onChange={handleReprintScan}
+                      onKeyDown={e => { if (e.key === 'Enter') submitReprintScan(); }}
+                      inputRef={reprintScanRef}
+                      placeholder="Scan or type a No., then Enter"
+                    />
+                  </div>
+                  {reprintNotFound && (
+                    <div style={{ marginTop: 12, fontSize: 13, color: '#c46' }}>
+                      No matching Gate Pass or Delivery Note found for &quot;{reprintScanValue}&quot;.
+                    </div>
+                  )}
+                  {reprintMatch && (
+                    <div style={{ marginTop: 16, border: `1px solid ${C.borderL}`, borderRadius: 10, padding: 14, display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+                      <div>
+                        <div style={{ fontWeight: 700, fontSize: 14 }}>
+                          {reprintMatch.type === 'gp' ? 'Gate Pass' : 'Delivery Note'} #{reprintMatch.no}
+                        </div>
+                        <div style={{ fontSize: 13, color: '#46514a', marginTop: 2 }}>{reprintMatch.customerProject}</div>
+                        <div style={{ fontSize: 12, color: '#9aa39d', marginTop: 2 }}>{reprintMatch.date}</div>
+                      </div>
+                      <Chip st={reprintMatch.status} />
+                    </div>
+                  )}
+                  <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 10, marginTop: 20 }}>
+                    <Btn onClick={() => setView('admin_reprints')} style={{ background: C.white, border: `1px solid #cfd8d2`, color: '#46514a', borderRadius: 9, padding: '11px 20px', fontSize: 14, fontWeight: 600, cursor: 'pointer' }}>
+                      Cancel
+                    </Btn>
+                    <Btn onClick={confirmReprint} disabled={!reprintMatch} style={{ background: reprintMatch ? C.primary : '#a9c9b6', color: C.white, border: 'none', borderRadius: 9, padding: '11px 22px', fontSize: 14, fontWeight: 700, cursor: reprintMatch ? 'pointer' : 'default' }} hov={reprintMatch ? { background: C.ph } : undefined}>
+                      View &amp; Print →
+                    </Btn>
+                  </div>
+                </div>
+              </div>
+            </div>
+          )}
+
+          {/* ── TAG PRINT: LIST (standalone plant tag / label — not tied to a Gate Pass or Delivery Note) ── */}
+          {view === 'admin_tags' && (
+            <div>
+              <div style={{ display: 'flex', alignItems: 'flex-end', justifyContent: 'space-between', marginBottom: 20 }}>
+                <div>
+                  <h1 style={{ fontFamily: 'var(--font-spectral),serif', fontWeight: 600, fontSize: 26, margin: 0 }}>Tag Print</h1>
+                  <p style={{ margin: '4px 0 0', color: '#5b6660', fontSize: 14 }}>Scan a serial number and print a plant tag (25.4cm × 2.5cm)</p>
+                </div>
+                <Btn onClick={openNewTag} style={{ background: C.primary, color: C.white, border: 'none', borderRadius: 9, padding: '11px 18px', fontSize: 14, fontWeight: 700, cursor: 'pointer' }} hov={{ background: C.ph }}>
+                  + New Tag
+                </Btn>
+              </div>
+              <div style={{ background: C.white, border: `1px solid ${C.border}`, borderRadius: 12, overflow: 'hidden' }}>
+                <table style={{ width: '100%', borderCollapse: 'collapse' }}>
+                  <thead>
+                    <tr style={{ background: '#f6f8f6' }}>
+                      {['SRL#', 'Plant Code', 'Plant Name', 'Size', 'Location', 'Warehouse', 'Printed By', 'Date'].map(h => <Th key={h}>{h}</Th>)}
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {plantTags.map(t => (
+                      <tr key={t.id} style={{ borderTop: `1px solid #eef1ee` }}>
+                        <td style={{ padding: '13px 16px', fontWeight: 700, fontSize: 14 }}>{t.srlNo}</td>
+                        <td style={{ padding: '13px 16px', fontSize: 13.5, color: '#46514a' }}>{t.plantCode || '—'}</td>
+                        <td style={{ padding: '13px 16px', fontSize: 13.5, color: '#46514a' }}>{t.plantName}</td>
+                        <td style={{ padding: '13px 16px', fontSize: 13.5, color: '#46514a' }}>{t.size || '—'}</td>
+                        <td style={{ padding: '13px 16px', fontSize: 13.5, color: '#46514a' }}>{t.location || '—'}</td>
+                        <td style={{ padding: '13px 16px', fontSize: 13.5, color: '#46514a' }}>{t.warehouse || '—'}</td>
+                        <td style={{ padding: '13px 16px', fontSize: 13.5, color: '#46514a' }}>{t.createdBy}</td>
+                        <td style={{ padding: '13px 16px', fontSize: 13.5, color: '#46514a' }}>{t.createdAt}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+                {plantTags.length === 0 && <Empty text="No tags printed yet." />}
+              </div>
+            </div>
+          )}
+
+          {/* ── TAG PRINT: NEW (Scan + direct print) ── */}
+          {view === 'admin_new_tag' && (
+            <div>
+              {/* Override the default @page size just for this view's print/PDF output —
+                  the tag is a small 25.4cm x 2.5cm strip, not A4. */}
+              <style>{'@page { size: 254mm 25mm; margin: 0; }'}</style>
+              <div data-print-hide>
+                <button onClick={() => setView('admin_tags')} style={{ background: 'none', border: 'none', color: '#5b6660', fontWeight: 600, fontSize: 13.5, cursor: 'pointer', marginBottom: 12, fontFamily: 'inherit' }}>← Cancel</button>
+                <div style={{ background: C.white, border: `1px solid ${C.border}`, borderRadius: 14, maxWidth: 560, overflow: 'hidden' }}>
+                  <div style={{ padding: '20px 24px', borderBottom: `1px solid ${C.borderL}` }}>
+                    <h1 style={{ fontFamily: 'var(--font-spectral),serif', fontWeight: 600, fontSize: 22, margin: 0 }}>New Tag</h1>
+                  </div>
+                  <div style={{ padding: '22px 24px' }}>
+                    <div>
+                      <FieldLabel>Scan SRL# *</FieldLabel>
+                      <Inp
+                        value={tagForm.srlNo}
+                        onChange={handleTagSrlScan}
+                        inputRef={tagScanRef}
+                        placeholder="Scan or type a serial number"
+                      />
+                    </div>
+                    <div style={{ marginTop: 16 }}>
+                      <FieldLabel>Plant Name *</FieldLabel>
+                      <PlantNameCombo
+                        value={tagForm.plantName}
+                        plants={plants}
+                        onChangeText={v => updateTagField('plantName', v)}
+                        onSelect={p => updateTagField('plantName', p.plantName)}
+                      />
+                    </div>
+                    <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 16, marginTop: 16 }}>
+                      <div>
+                        <FieldLabel>Plant Code</FieldLabel>
+                        <Inp value={tagForm.plantCode} onChange={v => updateTagField('plantCode', v)} placeholder="optional" />
+                      </div>
+                      <div>
+                        <FieldLabel>Size</FieldLabel>
+                        <Inp value={tagForm.size} onChange={v => updateTagField('size', v)} placeholder="e.g. CL_C_1.5LP" />
+                      </div>
+                    </div>
+                    <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 16, marginTop: 16 }}>
+                      <div>
+                        <FieldLabel>Location</FieldLabel>
+                        <LocationCombo
+                          value={tagForm.location}
+                          locations={locations}
+                          onChangeText={v => updateTagField('location', v)}
+                          onSelect={l => updateTagField('location', l.name)}
+                        />
+                      </div>
+                      <div>
+                        <FieldLabel>Warehouse</FieldLabel>
+                        <Inp value={tagForm.warehouse} onChange={v => updateTagField('warehouse', v)} placeholder="optional" />
+                      </div>
+                    </div>
+                    {tagError && <div style={{ marginTop: 12, fontSize: 13, color: '#c46' }}>{tagError}</div>}
+                    <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 10, marginTop: 20 }}>
+                      <Btn onClick={() => setView('admin_tags')} style={{ background: C.white, border: `1px solid #cfd8d2`, color: '#46514a', borderRadius: 9, padding: '11px 20px', fontSize: 14, fontWeight: 600, cursor: 'pointer' }}>
+                        Cancel
+                      </Btn>
+                      <Btn onClick={saveAndPrintTag} style={{ background: C.primary, color: C.white, border: 'none', borderRadius: 9, padding: '11px 22px', fontSize: 14, fontWeight: 700, cursor: 'pointer' }} hov={{ background: C.ph }}>
+                        Save &amp; Print
+                      </Btn>
+                    </div>
+                  </div>
+                </div>
+                <p style={{ maxWidth: 560, marginTop: 14, fontSize: 12.5, color: '#9aa39d' }}>Preview — this is what will print:</p>
+              </div>
+              <div data-print-hide style={{ height: 8 }} />
+              <div style={{ overflowX: 'auto' }}>
+                <PrintableTag
+                  tag={{ plantCode: tagForm.plantCode, plantName: tagForm.plantName || '—', srlNo: tagForm.srlNo || '—', size: tagForm.size, location: tagForm.location, warehouse: tagForm.warehouse, date: today() }}
+                  printRef={tagPrintRef}
+                />
+              </div>
+            </div>
+          )}
+
+          {/* ── ONHAND: LIST (standalone inventory snapshot, bulk-imported from an ERP export) ── */}
+          {view === 'admin_onhand' && (
+            <div>
+              <div style={{ display: 'flex', alignItems: 'flex-end', justifyContent: 'space-between', marginBottom: 20 }}>
+                <div>
+                  <h1 style={{ fontFamily: 'var(--font-spectral),serif', fontWeight: 600, fontSize: 26, margin: 0 }}>Onhand</h1>
+                  <p style={{ margin: '4px 0 0', color: '#5b6660', fontSize: 14 }}>Inventory snapshot — uploading a new Excel file replaces this list</p>
+                </div>
+                <div style={{ display: 'flex', gap: 10 }}>
+                  <Btn onClick={() => onhandFileRef.current?.click()} style={{ background: C.white, border: `1px solid #cfd8d2`, color: '#46514a', borderRadius: 9, padding: '11px 18px', fontSize: 14, fontWeight: 600, cursor: 'pointer' }}>
+                    ⇪ Upload Excel
+                  </Btn>
+                  <input
+                    ref={onhandFileRef}
+                    type="file"
+                    accept=".xlsx,.xls"
+                    style={{ display: 'none' }}
+                    onChange={e => {
+                      const file = e.target.files?.[0];
+                      if (file) handleOnhandExcelUpload(file);
+                      e.target.value = '';
+                    }}
+                  />
+                  <Btn onClick={openNewOnhand} style={{ background: C.primary, color: C.white, border: 'none', borderRadius: 9, padding: '11px 18px', fontSize: 14, fontWeight: 700, cursor: 'pointer' }} hov={{ background: C.ph }}>
+                    + New Item
+                  </Btn>
+                </div>
+              </div>
+              <p style={{ marginTop: '-12px', marginBottom: 16, fontSize: 12.5, color: '#9aa39d' }}>
+                Excel file must have &quot;Item Number&quot; and/or &quot;Item Name&quot; columns (Style, Search Name, Size, Color, Site, Warehouse, Location, Physical Inventory, Unit Rate are optional).
+              </p>
+              <div style={{ maxWidth: 360, marginBottom: 16 }}>
+                <Inp value={onhandSearch} onChange={setOnhandSearch} placeholder="Search item number, name, style..." />
+              </div>
+              <div style={{ background: C.white, border: `1px solid ${C.border}`, borderRadius: 12, overflow: 'hidden', overflowX: 'auto' }}>
+                <table style={{ width: '100%', borderCollapse: 'collapse' }}>
+                  <thead>
+                    <tr style={{ background: '#f6f8f6' }}>
+                      {['Style', 'Item Number', 'Item Name', 'Search Name', 'Size', 'Color', 'Site', 'Warehouse', 'Location', 'Physical Inventory', 'Unit Rate'].map(h => <Th key={h}>{h}</Th>)}
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {onhandItems
+                      .filter(it => {
+                        const q = onhandSearch.trim().toLowerCase();
+                        if (!q) return true;
+                        return [it.itemNumber, it.itemName, it.searchName, it.style].some(v => v.toLowerCase().includes(q));
+                      })
+                      .map(it => (
+                        <tr key={it.id} style={{ borderTop: `1px solid #eef1ee` }}>
+                          <td style={{ padding: '13px 16px', fontSize: 13.5, whiteSpace: 'nowrap' }}>{it.style || '—'}</td>
+                          <td style={{ padding: '13px 16px', fontWeight: 700, fontSize: 14, whiteSpace: 'nowrap' }}>{it.itemNumber || '—'}</td>
+                          <td style={{ padding: '13px 16px', fontSize: 13.5, color: '#46514a' }}>{it.itemName || '—'}</td>
+                          <td style={{ padding: '13px 16px', fontSize: 13.5, color: '#46514a' }}>{it.searchName || '—'}</td>
+                          <td style={{ padding: '13px 16px', fontSize: 13.5, whiteSpace: 'nowrap' }}>{it.size || '—'}</td>
+                          <td style={{ padding: '13px 16px', fontSize: 13.5, whiteSpace: 'nowrap' }}>{it.color || '—'}</td>
+                          <td style={{ padding: '13px 16px', fontSize: 13.5, whiteSpace: 'nowrap' }}>{it.site || '—'}</td>
+                          <td style={{ padding: '13px 16px', fontSize: 13.5, whiteSpace: 'nowrap' }}>{it.warehouse || '—'}</td>
+                          <td style={{ padding: '13px 16px', fontSize: 13.5, whiteSpace: 'nowrap' }}>{it.location || '—'}</td>
+                          <td style={{ padding: '13px 16px', fontSize: 13.5, textAlign: 'right' }}>{it.physicalInventory.toFixed(2)}</td>
+                          <td style={{ padding: '13px 16px', fontSize: 13.5, textAlign: 'right' }}>{it.unitRate.toFixed(2)}</td>
+                        </tr>
+                      ))}
+                  </tbody>
+                </table>
+                {onhandItems.length === 0 && <Empty text="No onhand data yet." />}
+              </div>
+            </div>
+          )}
+
+          {/* ── ONHAND: NEW (manual single-item entry) ── */}
+          {view === 'admin_new_onhand' && (
+            <div>
+              <button onClick={() => setView('admin_onhand')} style={{ background: 'none', border: 'none', color: '#5b6660', fontWeight: 600, fontSize: 13.5, cursor: 'pointer', marginBottom: 12, fontFamily: 'inherit' }}>← Cancel</button>
+              <div style={{ background: C.white, border: `1px solid ${C.border}`, borderRadius: 14, maxWidth: 640, overflow: 'hidden' }}>
+                <div style={{ padding: '20px 24px', borderBottom: `1px solid ${C.borderL}` }}>
+                  <h1 style={{ fontFamily: 'var(--font-spectral),serif', fontWeight: 600, fontSize: 22, margin: 0 }}>New Onhand Item</h1>
+                </div>
+                <div style={{ padding: '22px 24px' }}>
+                  <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 16 }}>
+                    <div>
+                      <FieldLabel>Style</FieldLabel>
+                      <Inp value={onhandForm.style} onChange={v => updateOnhandField('style', v)} placeholder="optional" />
+                    </div>
+                    <div>
+                      <FieldLabel>Item Number *</FieldLabel>
+                      <Inp value={onhandForm.itemNumber} onChange={v => updateOnhandField('itemNumber', v)} placeholder="e.g. B00000001" />
+                    </div>
+                    <div>
+                      <FieldLabel>Item Name</FieldLabel>
+                      <Inp value={onhandForm.itemName} onChange={v => updateOnhandField('itemName', v)} placeholder="optional" />
+                    </div>
+                    <div>
+                      <FieldLabel>Search Name</FieldLabel>
+                      <Inp value={onhandForm.searchName} onChange={v => updateOnhandField('searchName', v)} placeholder="optional" />
+                    </div>
+                    <div>
+                      <FieldLabel>Size</FieldLabel>
+                      <Inp value={onhandForm.size} onChange={v => updateOnhandField('size', v)} placeholder="optional" />
+                    </div>
+                    <div>
+                      <FieldLabel>Color</FieldLabel>
+                      <Inp value={onhandForm.color} onChange={v => updateOnhandField('color', v)} placeholder="optional" />
+                    </div>
+                    <div>
+                      <FieldLabel>Site</FieldLabel>
+                      <Inp value={onhandForm.site} onChange={v => updateOnhandField('site', v)} placeholder="optional" />
+                    </div>
+                    <div>
+                      <FieldLabel>Warehouse</FieldLabel>
+                      <Inp value={onhandForm.warehouse} onChange={v => updateOnhandField('warehouse', v)} placeholder="optional" />
+                    </div>
+                    <div>
+                      <FieldLabel>Location</FieldLabel>
+                      <Inp value={onhandForm.location} onChange={v => updateOnhandField('location', v)} placeholder="optional" />
+                    </div>
+                    <div>
+                      <FieldLabel>Physical Inventory</FieldLabel>
+                      <Inp value={onhandForm.physicalInventory} onChange={v => updateOnhandField('physicalInventory', v)} placeholder="0" />
+                    </div>
+                    <div>
+                      <FieldLabel>Unit Rate</FieldLabel>
+                      <Inp value={onhandForm.unitRate} onChange={v => updateOnhandField('unitRate', v)} placeholder="0" />
+                    </div>
+                  </div>
+                  <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 10, marginTop: 20 }}>
+                    <Btn onClick={() => setView('admin_onhand')} style={{ background: C.white, border: `1px solid #cfd8d2`, color: '#46514a', borderRadius: 9, padding: '11px 20px', fontSize: 14, fontWeight: 600, cursor: 'pointer' }}>
+                      Cancel
+                    </Btn>
+                    <Btn onClick={saveOnhandItem} style={{ background: C.primary, color: C.white, border: 'none', borderRadius: 9, padding: '11px 22px', fontSize: 14, fontWeight: 700, cursor: 'pointer' }} hov={{ background: C.ph }}>
+                      Save Item
+                    </Btn>
+                  </div>
+                </div>
+              </div>
+            </div>
+          )}
+
           {/* ── REPORT (Admin + Garden): combined Gate Pass + Delivery Note line items ── */}
           {view === 'report' && (
             <div>
@@ -2541,6 +3184,15 @@ export default function GatePassApp() {
                     placeholder="Search or type..."
                   />
                 </div>
+                <div style={{ minWidth: 170 }}>
+                  <FieldLabel>Project</FieldLabel>
+                  <FilterCombo
+                    value={reportFilterProject}
+                    options={reportProjectOptions}
+                    onChange={setReportFilterProject}
+                    placeholder="Search or type..."
+                  />
+                </div>
                 <div style={{ minWidth: 150 }}>
                   <FieldLabel>From Date</FieldLabel>
                   <Inp value={reportFilterFromDate} onChange={setReportFilterFromDate} type="date" />
@@ -2558,10 +3210,10 @@ export default function GatePassApp() {
                     placeholder="Search or type..."
                   />
                 </div>
-                {(reportFilterGpNo || reportFilterDnNo || reportFilterCustomerProject || reportFilterFromDate || reportFilterToDate || reportFilterStatus) && (
+                {(reportFilterGpNo || reportFilterDnNo || reportFilterCustomerProject || reportFilterProject || reportFilterFromDate || reportFilterToDate || reportFilterStatus) && (
                   <div style={{ display: 'flex', alignItems: 'flex-end' }}>
                     <button
-                      onClick={() => { setReportFilterGpNo(''); setReportFilterDnNo(''); setReportFilterCustomerProject(''); setReportFilterFromDate(''); setReportFilterToDate(''); setReportFilterStatus(''); }}
+                      onClick={() => { setReportFilterGpNo(''); setReportFilterDnNo(''); setReportFilterCustomerProject(''); setReportFilterProject(''); setReportFilterFromDate(''); setReportFilterToDate(''); setReportFilterStatus(''); }}
                       style={{ background: 'none', border: 'none', color: C.primary, fontWeight: 700, fontSize: 13, cursor: 'pointer', fontFamily: 'inherit', padding: '9px 4px' }}
                     >
                       Clear filters
@@ -2948,6 +3600,57 @@ function DnTableRow({ dn, onOpen, scanned, target }: { dn: DeliveryNote; onOpen:
   );
 }
 
+// ── Printable Plant Tag (standalone label, 25.4cm x 2.5cm) ──
+// The @page override for this exact size is injected inline while this view
+// is active (see the <style> tag in the admin_new_tag screen) rather than
+// via a named CSS page — Chromium was inserting a spurious blank leading
+// page when a named @page size was assigned to an element nested deep in
+// the app's layout tree.
+function PrintableTag({ tag, printRef }: {
+  tag: { plantCode: string; plantName: string; srlNo: string; size: string; location: string; warehouse: string; date: string };
+  printRef?: React.RefObject<HTMLDivElement | null>;
+}) {
+  const panelDivider: React.CSSProperties = { borderRight: '1px solid #888' };
+  // Matches the existing external lookup system's QR format so tags printed
+  // here scan the same way as their other labels — and so extractScanCode()
+  // (which parses this exact ?s=A~B~C shape) can pull the serial back out.
+  const qrUrl = `http://acaciallc.dyndns.org/index.php?s=${tag.plantCode}~${tag.srlNo}~${tag.size}`;
+  return (
+    <div
+      ref={printRef}
+      data-print-doc
+      style={{ display: 'flex', width: '254mm', height: '25mm', boxSizing: 'border-box', border: '1px solid #888', background: '#fff', overflow: 'hidden', fontFamily: 'inherit' }}
+    >
+      <div style={{ ...panelDivider, flex: '0 0 24%', padding: '3mm 3mm', display: 'flex', gap: '2mm', alignItems: 'center', minWidth: 0 }}>
+        <QrCode value={qrUrl} size={68} color="#000000" />
+        <div style={{ fontSize: 8, lineHeight: 1.35, minWidth: 0 }}>
+          <div style={{ fontWeight: 700, fontSize: 9.5 }}>{tag.plantCode}</div>
+          <div style={{ marginTop: 1 }}>{tag.plantName}</div>
+          <div style={{ marginTop: 4, fontWeight: 700 }}>SRL#:{tag.srlNo}</div>
+          <div>Size: {tag.size}</div>
+        </div>
+      </div>
+      <div style={{ ...panelDivider, flex: '0 0 29%', padding: '3mm 3mm', display: 'flex', gap: '2mm', alignItems: 'center', minWidth: 0 }}>
+        <QrCode value={qrUrl} size={68} color="#000000" />
+        <div style={{ fontSize: 8, lineHeight: 1.35, minWidth: 0 }}>
+          <div style={{ fontWeight: 700, fontSize: 9.5 }}>{tag.plantCode}</div>
+          <div style={{ marginTop: 1 }}>{tag.plantName}</div>
+          <div style={{ marginTop: 4, fontWeight: 700 }}>Size :{tag.size}</div>
+        </div>
+      </div>
+      <div style={{ flex: 1, padding: '3mm 4mm', display: 'flex', alignItems: 'center', justifyContent: 'space-between', minWidth: 0 }}>
+        <div style={{ fontSize: 8, lineHeight: 1.4 }}>
+          <div style={{ textAlign: 'right', color: '#333' }}>Date: {tag.date}</div>
+          <div style={{ fontWeight: 700, marginTop: 4 }}>SRL#:{tag.srlNo}</div>
+          <div>Location:{tag.location}</div>
+          <div>Warehouse:{tag.warehouse}</div>
+        </div>
+        <Logo style={{ width: 68, height: 65, color: '#123c2b', flexShrink: 0 }} />
+      </div>
+    </div>
+  );
+}
+
 function PrintableGP({ gp, printRef }: { gp: GatePass; printRef?: React.RefObject<HTMLDivElement | null> }) {
   return (
     <div ref={printRef} data-print-doc style={{ background: '#fff', border: '1px solid #e2e7e3', borderRadius: 10, maxWidth: 920, margin: '0 auto', padding: '34px 40px' }}>
@@ -3030,7 +3733,7 @@ function DnHeaderField({ label, value, onChange, editMode, align, minWidth = 96,
   );
 }
 
-function ViewDeliveryNote({ dn, gp, role, scanned, target, onBack, onContinueScan, onRemoveSerial, onPrint, onSaveHeader, onSaveLine, onSaveDoRef, onSaveGpRefs, onSplitLine, onRemoveLine }: {
+function ViewDeliveryNote({ dn, gp, role, scanned, target, onBack, onContinueScan, onRemoveSerial, onPrint, onSaveHeader, onSaveLine, onSaveDoRef, onSaveGpRefs, onRemoveLine, onAddAttachment, onRemoveAttachment }: {
   dn: DeliveryNote; gp: GatePass | null; role: string; scanned: number; target: number;
   onBack: () => void; onContinueScan: () => void;
   onRemoveSerial: (slNo: number, code: string) => void; onPrint: () => void;
@@ -3038,13 +3741,14 @@ function ViewDeliveryNote({ dn, gp, role, scanned, target, onBack, onContinueSca
   onSaveLine: (dnNo: string, slNo: number, form: { postedQty: string; remarks: string }) => void;
   onSaveDoRef: (dnNo: string, slNo: number, doRef: string) => void;
   onSaveGpRefs: (gpNo: string, form: { soRef: string; prRef: string; lpoNo: string }) => void;
-  onSplitLine: (dnNo: string, slNo: number) => void;
   onRemoveLine: (dnNo: string, slNo: number) => void;
+  onAddAttachment: (dnNo: string, file: { name: string; type: string; size: number; dataUrl: string }) => void;
+  onRemoveAttachment: (dnNo: string, attachmentId: string) => void;
 }) {
   const isComplete = dn.status === 'completed';
   const isScanning = dn.status === 'scanning';
   const printRef = useRef<HTMLDivElement | null>(null);
-  const { downloading, shareMenuOpen, setShareMenuOpen, sharing, handleDownloadPdf, handleSharePdf, handleShareWhatsApp } = usePdfShare(printRef, { doubleUp: true });
+  const { downloading, shareMenuOpen, setShareMenuOpen, sharing, handleDownloadPdf, handleSharePdf, handleShareWhatsApp } = usePdfShare(printRef, { orientation: 'landscape', paginated: true });
 
   const [editMode, setEditMode] = useState(false);
 
@@ -3081,7 +3785,29 @@ function ViewDeliveryNote({ dn, gp, role, scanned, target, onBack, onContinueSca
 
   // Mandatory DO Reference gate: fires once at Save time (not per line as you type) for any
   // line whose SYS Posted Qty just changed and still has no DO Reference.
-  const [doRefModal, setDoRefModal] = useState<{ lines: DNLine[]; values: Record<number, string>; splitSlNos: number[] } | null>(null);
+  const [doRefModal, setDoRefModal] = useState<{ lines: DNLine[]; values: Record<number, string> } | null>(null);
+
+  const attachFileRef = useRef<HTMLInputElement>(null);
+  const [uploadingAttachment, setUploadingAttachment] = useState(false);
+  const [attachError, setAttachError] = useState<string | null>(null);
+  const [previewAttachment, setPreviewAttachment] = useState<DNAttachment | null>(null);
+  const handleAttachFiles = async (files: FileList | null) => {
+    if (!files || !files.length) return;
+    setAttachError(null);
+    setUploadingAttachment(true);
+    try {
+      for (const file of Array.from(files)) {
+        if (file.size > MAX_ATTACHMENT_BYTES) {
+          setAttachError(`"${file.name}" is too large — max 5MB per file`);
+          continue;
+        }
+        const dataUrl = await readFileAsDataUrl(file);
+        onAddAttachment(dn.no, { name: file.name, type: file.type, size: file.size, dataUrl });
+      }
+    } finally {
+      setUploadingAttachment(false);
+    }
+  };
 
   const startEdit = () => setEditMode(true);
   const cancelEdit = () => {
@@ -3094,7 +3820,7 @@ function ViewDeliveryNote({ dn, gp, role, scanned, target, onBack, onContinueSca
     setEditMode(false);
   };
 
-  const finalizeSave = (splitSlNos: number[], doRefValues: Record<number, string> = {}) => {
+  const finalizeSave = (doRefValues: Record<number, string> = {}) => {
     onSaveHeader(dn.no, headerForm);
     if (gp) onSaveGpRefs(gp.no, gpRefsForm);
     dn.lines.forEach(l => {
@@ -3105,7 +3831,6 @@ function ViewDeliveryNote({ dn, gp, role, scanned, target, onBack, onContinueSca
       if (doRefVal !== undefined) onSaveDoRef(dn.no, l.slNo, doRefVal);
     });
     pendingRemovals.forEach(slNo => onRemoveLine(dn.no, slNo));
-    splitSlNos.forEach(slNo => onSplitLine(dn.no, slNo));
     setEditMode(false);
     setDoRefModal(null);
   };
@@ -3117,22 +3842,17 @@ function ViewDeliveryNote({ dn, gp, role, scanned, target, onBack, onContinueSca
       return !!form && form.postedQty !== l.postedQty;
     });
     const needingDoRef = changedLines.filter(l => !l.doRef);
-    // Any line whose posted qty was just updated and still falls short of Qty automatically
-    // gets a new Pending Item line for the remainder — no manual confirmation step.
-    const splitSlNos = changedLines
-      .filter(l => !l.hasSplit && (Number(lineForm[l.slNo]?.postedQty) || 0) < l.deliveryQty)
-      .map(l => l.slNo);
 
     if (needingDoRef.length > 0) {
-      setDoRefModal({ lines: needingDoRef, values: Object.fromEntries(needingDoRef.map(l => [l.slNo, ''])), splitSlNos });
+      setDoRefModal({ lines: needingDoRef, values: Object.fromEntries(needingDoRef.map(l => [l.slNo, ''])) });
     } else {
-      finalizeSave(splitSlNos);
+      finalizeSave();
     }
   };
 
   const submitDoRefModal = () => {
     if (!doRefModal) return;
-    finalizeSave(doRefModal.splitSlNos, doRefModal.values);
+    finalizeSave(doRefModal.values);
   };
   const doRefModalIncomplete = doRefModal ? doRefModal.lines.some(l => !doRefModal.values[l.slNo]?.trim()) : true;
 
@@ -3186,7 +3906,7 @@ function ViewDeliveryNote({ dn, gp, role, scanned, target, onBack, onContinueSca
 
             const renderRow = (ln: DNLine, displaySlNo: number) => {
               const marked = pendingRemovals.has(ln.slNo);
-              const status = lineStatus(ln.postedQty, ln.deliveryQty, ln.hasSplit);
+              const status = lineStatus(ln.postedQty, ln.deliveryQty);
               const rowStyle: React.CSSProperties = marked ? { opacity: 0.45, textDecoration: 'line-through' } : {};
               return (
                 <tr key={ln.slNo} style={rowStyle}>
@@ -3299,19 +4019,13 @@ function ViewDeliveryNote({ dn, gp, role, scanned, target, onBack, onContinueSca
         </div>
       </div>
 
-      {/* Printable DN — screen view is a single copy. PDF export paginates + duplicates it
-          (see buildDeliveryNotePdf); the browser Print output gets the same upper+lower
-          duplicate via the .print-only block below, which is invisible on screen. */}
-      <div ref={printRef} data-print-doc style={{ background: '#fff', border: '1px solid #e2e7e3', borderRadius: 10, maxWidth: 920, margin: '0 auto', padding: '34px 44px' }}>
+      {/* Printable DN — single copy on screen, in PDF, and in print. Print/PDF render
+          on A4 landscape (see .dn-print-landscape in globals.css and the 'landscape'
+          orientation passed to usePdfShare below) since the table is wide. */}
+      <div ref={printRef} data-print-doc className="dn-print-landscape" style={{ background: '#fff', border: '1px solid #e2e7e3', borderRadius: 10, maxWidth: 920, margin: '0 auto', padding: '34px 44px' }}>
         {renderDnCopy()}
-        <div className="print-only">
-          <div style={{ position: 'relative', borderTop: '1px dashed #9aa39d', margin: '24px 0 0', paddingTop: 14 }}>
-            <span style={{ position: 'absolute', left: '50%', top: -8, transform: 'translateX(-50%)', background: '#fff', padding: '0 10px', fontSize: 11, color: '#9aa39d', letterSpacing: '.04em' }}>✂ cut here</span>
-          </div>
-          {renderDnCopy()}
-        </div>
         <div data-print-hide style={{ display: 'flex', justifyContent: 'flex-end', gap: 10, marginTop: 24 }}>
-          {isScanning && (
+          {(isScanning || isComplete) && (
             <Btn onClick={onContinueScan} style={{ background: C.white, border: '1px solid #cfd8d2', color: C.primary, borderRadius: 9, padding: '10px 18px', fontSize: 14, fontWeight: 700, cursor: 'pointer' }}>
               Scanner
             </Btn>
@@ -3356,9 +4070,7 @@ function ViewDeliveryNote({ dn, gp, role, scanned, target, onBack, onContinueSca
                   {ln.serials.map(code => (
                     <span key={code} style={{ fontFamily: 'ui-monospace,monospace', fontSize: 12, background: '#f1f5f2', border: '1px solid #dde6df', color: '#2c3a32', padding: '4px 9px', borderRadius: 6, display: 'inline-flex', alignItems: 'center', gap: 5 }}>
                       {code}
-                      {!isComplete && (
-                        <button onClick={() => onRemoveSerial(ln.slNo, code)} style={{ background: 'none', border: 'none', cursor: 'pointer', color: '#c46', fontSize: 14, lineHeight: 1, padding: 0, marginLeft: 2, fontFamily: 'inherit' }}>×</button>
-                      )}
+                      <button onClick={() => onRemoveSerial(ln.slNo, code)} style={{ background: 'none', border: 'none', cursor: 'pointer', color: '#c46', fontSize: 14, lineHeight: 1, padding: 0, marginLeft: 2, fontFamily: 'inherit' }}>×</button>
                     </span>
                   ))}
                   {ln.serials.length === 0 && <span style={{ fontSize: 12.5, color: C.amber }}>No barcodes scanned yet</span>}
@@ -3368,6 +4080,63 @@ function ViewDeliveryNote({ dn, gp, role, scanned, target, onBack, onContinueSca
           })}
         </div>
       </div>
+
+      {/* Attachments (Photo / Excel / PDF reference files) — not part of the printable document */}
+      <div data-print-hide style={{ background: '#fff', border: '1px solid #e2e7e3', borderRadius: 12, maxWidth: 920, margin: '18px auto 0', overflow: 'hidden' }}>
+        <div style={{ padding: '16px 20px', borderBottom: '1px solid #eef1ee', display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+          <div style={{ fontWeight: 700, fontSize: 16 }}>Attachments</div>
+          <Btn onClick={() => attachFileRef.current?.click()} disabled={uploadingAttachment} style={{ background: C.white, border: `1px solid ${C.primary}`, color: C.primary, borderRadius: 9, padding: '8px 14px', fontSize: 13, fontWeight: 700, cursor: uploadingAttachment ? 'default' : 'pointer', opacity: uploadingAttachment ? 0.6 : 1 }}>
+            {uploadingAttachment ? 'Uploading…' : '⇪ Add File'}
+          </Btn>
+          <input
+            ref={attachFileRef}
+            type="file"
+            multiple
+            accept=".pdf,.jpg,.jpeg,.png,.xlsx,.xls"
+            style={{ display: 'none' }}
+            onChange={e => { handleAttachFiles(e.target.files); e.target.value = ''; }}
+          />
+        </div>
+        <div style={{ padding: '8px 20px 20px' }}>
+          {attachError && <div style={{ color: '#c46', fontSize: 12.5, margin: '8px 0' }}>{attachError}</div>}
+          {dn.attachments.length === 0 && !attachError && (
+            <div style={{ padding: '14px 0' }}><Empty text="No attachments yet — add photos, Excel sheets, or PDFs." /></div>
+          )}
+          {dn.attachments.map(a => (
+            <div key={a.id} style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '10px 0', borderBottom: '1px solid #f1f4f1' }}>
+              <button
+                onClick={() => a.type.startsWith('image/') ? setPreviewAttachment(a) : downloadDataUrl(a.dataUrl, a.name)}
+                style={{ display: 'flex', flexDirection: 'column', alignItems: 'flex-start', textAlign: 'left', background: 'none', border: 'none', cursor: 'pointer', fontFamily: 'inherit', padding: 0 }}
+              >
+                <span style={{ fontSize: 13.5, fontWeight: 600, color: C.primary }}>{a.name}</span>
+                <span style={{ fontSize: 11.5, color: '#9aa39d' }}>{formatBytes(a.size)} · {a.uploadedBy} · {a.uploadedAt}</span>
+              </button>
+              <button onClick={() => onRemoveAttachment(dn.no, a.id)} style={{ background: 'none', border: 'none', color: '#c46', fontSize: 17, cursor: 'pointer', lineHeight: 1, fontFamily: 'inherit', padding: '0 4px' }}>×</button>
+            </div>
+          ))}
+        </div>
+      </div>
+
+      {previewAttachment && (
+        <div
+          data-print-hide
+          onClick={() => setPreviewAttachment(null)}
+          style={{ position: 'fixed', inset: 0, background: 'rgba(20,30,24,.55)', display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 100 }}
+        >
+          <div onClick={e => e.stopPropagation()} style={{ background: C.white, borderRadius: 14, padding: 16, boxShadow: '0 24px 60px rgba(0,0,0,.3)', maxWidth: '90vw' }}>
+            <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 10, gap: 20 }}>
+              <span style={{ fontSize: 13.5, fontWeight: 600 }}>{previewAttachment.name}</span>
+              <button onClick={() => setPreviewAttachment(null)} style={{ background: 'none', border: 'none', color: '#5b6660', fontSize: 18, cursor: 'pointer', lineHeight: 1, fontFamily: 'inherit' }}>×</button>
+            </div>
+            <img src={previewAttachment.dataUrl} alt={previewAttachment.name} style={{ display: 'block', maxWidth: 320, maxHeight: 320, borderRadius: 8, objectFit: 'contain' }} />
+            <div style={{ display: 'flex', justifyContent: 'flex-end', marginTop: 12 }}>
+              <Btn onClick={() => downloadDataUrl(previewAttachment.dataUrl, previewAttachment.name)} style={{ background: C.white, border: `1px solid ${C.primary}`, color: C.primary, borderRadius: 9, padding: '8px 14px', fontSize: 13, fontWeight: 700, cursor: 'pointer' }}>
+                Download
+              </Btn>
+            </div>
+          </div>
+        </div>
+      )}
 
       {doRefModal && (
         <div data-print-hide style={{ position: 'fixed', inset: 0, background: 'rgba(20,30,24,.45)', display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 100 }}>

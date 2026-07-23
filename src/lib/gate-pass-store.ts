@@ -55,6 +55,16 @@ export interface DNLine {
   doRef: string;
 }
 
+export interface DNAttachment {
+  id: string;
+  name: string;
+  type: string;
+  size: number;
+  dataUrl: string;
+  uploadedBy: string;
+  uploadedAt: string;
+}
+
 export interface DeliveryNote {
   no: string;
   gpNo: string;
@@ -68,6 +78,7 @@ export interface DeliveryNote {
   modifiedAt: string | null;
   status: 'scanning' | 'completed';
   lines: DNLine[];
+  attachments: DNAttachment[];
 }
 
 export interface Customer {
@@ -130,6 +141,47 @@ export interface NumberSettings {
   dnNext: number;
 }
 
+export interface ReprintLog {
+  id: string;
+  docType: 'gp' | 'dn';
+  docNo: string;
+  customerProject: string;
+  createdBy: string;
+  createdAt: string;
+}
+
+// Standalone plant tag / label print (not tied to a Gate Pass or Delivery Note) —
+// scanned SRL# is checked for duplicates before a new tag is created.
+export interface PlantTag {
+  id: string;
+  plantCode: string;
+  plantName: string;
+  srlNo: string;
+  size: string;
+  location: string;
+  warehouse: string;
+  createdBy: string;
+  createdAt: string;
+}
+
+// Onhand inventory snapshot (bulk-imported from an ERP export) — re-uploading
+// replaces the whole table rather than accumulating, since this represents a
+// point-in-time stock snapshot, not an accumulating master list.
+export interface OnhandItem {
+  id: string;
+  style: string;
+  itemNumber: string;
+  itemName: string;
+  searchName: string;
+  size: string;
+  color: string;
+  site: string;
+  warehouse: string;
+  location: string;
+  physicalInventory: number;
+  unitRate: number;
+}
+
 export interface AppData {
   gps: GatePass[];
   dns: DeliveryNote[];
@@ -139,6 +191,9 @@ export interface AppData {
   users: UserAccount[];
   numberSettings: NumberSettings;
   lpoSoMappings: LpoSoMapping[];
+  reprintLogs: ReprintLog[];
+  plantTags: PlantTag[];
+  onhandItems: OnhandItem[];
 }
 
 
@@ -187,12 +242,18 @@ export interface DataStore {
   addSerial(dnNo: string, slNo: number, code: string): Promise<DeliveryNote>;
   removeSerial(dnNo: string, slNo: number, code: string): Promise<DeliveryNote>;
   completeDeliveryNote(dnNo: string): Promise<DeliveryNote>;
+  addDeliveryNoteAttachment(dnNo: string, file: { name: string; type: string; size: number; dataUrl: string }): Promise<DeliveryNote>;
+  removeDeliveryNoteAttachment(dnNo: string, attachmentId: string): Promise<DeliveryNote>;
   createCustomer(form: { customerName: string; party: 'EXT' | 'INT'; projects: string[] }): Promise<Customer>;
   updateCustomer(id: string, form: { customerName: string; party: 'EXT' | 'INT'; projects: string[] }): Promise<Customer>;
   createPlantMaster(form: { category: string; plantName: string }): Promise<PlantMaster>;
   createPlantsBulk(rows: Array<{ category: string; plantName: string }>): Promise<PlantMaster[]>;
   createLocation(form: { name: string }): Promise<LocationMaster>;
   createLpoSoMapping(form: { customerName: string; project: string; poNo: string; soRef: string }): Promise<LpoSoMapping>;
+  createReprintLog(form: { docType: 'gp' | 'dn'; docNo: string; customerProject: string }): Promise<ReprintLog>;
+  createPlantTag(form: { plantCode: string; plantName: string; srlNo: string; size: string; location: string; warehouse: string }): Promise<PlantTag>;
+  replaceOnhandItems(rows: Array<Omit<OnhandItem, 'id'>>): Promise<OnhandItem[]>;
+  createOnhandItem(form: Omit<OnhandItem, 'id'>): Promise<OnhandItem>;
   createUserAccount(form: { username: string; password: string; role: 'admin' | 'garden' }): Promise<UserAccount>;
   resetPassword(id: string, newPassword: string): Promise<UserAccount>;
   deleteUserAccount(id: string): Promise<void>;
@@ -279,6 +340,7 @@ function seedData(): AppData {
             serials: ['AC-900311','AC-900312','AC-900313','AC-900314'], hasSplit: false, isPending: false, doRef: '',
           },
         ],
+        attachments: [],
       },
     ],
     customers: [],
@@ -287,6 +349,9 @@ function seedData(): AppData {
     users: defaultUsers(),
     numberSettings: defaultNumberSettings(),
     lpoSoMappings: [],
+    reprintLogs: [],
+    plantTags: [],
+    onhandItems: [],
   };
 }
 
@@ -325,6 +390,7 @@ export class LocalStore implements DataStore {
             dns: (d.dns || []).map(dn => ({
               ...dn, modifiedBy: dn.modifiedBy ?? null, modifiedAt: dn.modifiedAt ?? null,
               lines: dn.lines.map(l => ({ ...l, location: l.location || '', postedQty: l.postedQty || '0', remainingQty: l.remainingQty || '0', hasSplit: l.hasSplit ?? false, isPending: l.isPending ?? false, doRef: l.doRef ?? '' })),
+              attachments: Array.isArray(dn.attachments) ? dn.attachments : [],
             })),
             customers: (d.customers || []).map(c => ({
               ...c, projects: c.projects || [], createdBy: c.createdBy || 'Admin',
@@ -337,6 +403,9 @@ export class LocalStore implements DataStore {
               .map(u => ({ ...u, modifiedBy: u.modifiedBy ?? null, modifiedAt: u.modifiedAt ?? null })),
             numberSettings: d.numberSettings ?? defaultNumberSettings(),
             lpoSoMappings: (d.lpoSoMappings || []).map(m => ({ ...m, modifiedBy: m.modifiedBy ?? null, modifiedAt: m.modifiedAt ?? null })),
+            reprintLogs: d.reprintLogs || [],
+            plantTags: (d.plantTags || []).map(t => ({ ...t, warehouse: t.warehouse || '' })),
+            onhandItems: d.onhandItems || [],
           };
           if ((!d.locations || !d.locations.length) || (!d.users || !d.users.length) || !d.numberSettings) this.write(result);
           return result;
@@ -458,6 +527,7 @@ export class LocalStore implements DataStore {
       preparedBy: this.auth?.name || 'Garden Incharge',
       modifiedBy: null, modifiedAt: null,
       status: 'scanning', lines: dnLines,
+      attachments: [],
     };
 
     this.write({
@@ -575,7 +645,9 @@ export class LocalStore implements DataStore {
     const data = this.read();
     const dn = data.dns.find(d => d.no === dnNo);
     if (!dn) throw new Error('Delivery note not found');
-    if (dn.status === 'completed') throw new Error('Delivery note is already completed');
+    // Completed delivery notes can still have a barcode swapped (cancel the
+    // wrong one, scan the correct one) — the Qty cap below is what actually
+    // prevents over-scanning, not the completed status.
     const line = dn.lines.find(l => l.slNo === slNo);
     if (!line) throw new Error('Delivery note line not found');
     if (line.serials.includes(code)) throw new Error('Duplicate barcode: ' + code);
@@ -591,7 +663,6 @@ export class LocalStore implements DataStore {
     const data = this.read();
     const dn = data.dns.find(d => d.no === dnNo);
     if (!dn) throw new Error('Delivery note not found');
-    if (dn.status === 'completed') throw new Error('Delivery note is already completed');
     const line = dn.lines.find(l => l.slNo === slNo);
     if (!line) throw new Error('Delivery note line not found');
     line.serials = line.serials.filter(s => s !== code);
@@ -609,6 +680,32 @@ export class LocalStore implements DataStore {
     if (incomplete) throw new Error('Some lines are not fully scanned');
     dn.status = 'completed';
     dn.modifiedBy = this.auth?.name || 'Garden Incharge';
+    dn.modifiedAt = today();
+    this.write(data);
+    return dn;
+  }
+
+  async addDeliveryNoteAttachment(dnNo: string, file: { name: string; type: string; size: number; dataUrl: string }): Promise<DeliveryNote> {
+    const data = this.read();
+    const dn = data.dns.find(d => d.no === dnNo);
+    if (!dn) throw new Error('Delivery note not found');
+    const attachment: DNAttachment = {
+      id: nanoid(), name: file.name, type: file.type, size: file.size, dataUrl: file.dataUrl,
+      uploadedBy: this.auth?.name || 'Admin', uploadedAt: today(),
+    };
+    dn.attachments = [...dn.attachments, attachment];
+    dn.modifiedBy = this.auth?.name || 'Admin';
+    dn.modifiedAt = today();
+    this.write(data);
+    return dn;
+  }
+
+  async removeDeliveryNoteAttachment(dnNo: string, attachmentId: string): Promise<DeliveryNote> {
+    const data = this.read();
+    const dn = data.dns.find(d => d.no === dnNo);
+    if (!dn) throw new Error('Delivery note not found');
+    dn.attachments = dn.attachments.filter(a => a.id !== attachmentId);
+    dn.modifiedBy = this.auth?.name || 'Admin';
     dn.modifiedAt = today();
     this.write(data);
     return dn;
@@ -703,6 +800,56 @@ export class LocalStore implements DataStore {
     };
     this.write({ ...data, lpoSoMappings: [m, ...data.lpoSoMappings] });
     return m;
+  }
+
+  async createReprintLog(form: { docType: 'gp' | 'dn'; docNo: string; customerProject: string }): Promise<ReprintLog> {
+    const data = this.read();
+    const log: ReprintLog = {
+      id: nanoid(),
+      docType: form.docType,
+      docNo: form.docNo,
+      customerProject: form.customerProject,
+      createdBy: this.auth?.name || 'Admin',
+      createdAt: today(),
+    };
+    this.write({ ...data, reprintLogs: [log, ...data.reprintLogs] });
+    return log;
+  }
+
+  async createPlantTag(form: { plantCode: string; plantName: string; srlNo: string; size: string; location: string; warehouse: string }): Promise<PlantTag> {
+    const data = this.read();
+    const srlNo = form.srlNo.trim();
+    if (!srlNo) throw new Error('SRL# is required');
+    if (data.plantTags.some(t => t.srlNo.toLowerCase() === srlNo.toLowerCase())) {
+      throw new Error(`SRL# ${srlNo} is already tagged`);
+    }
+    const tag: PlantTag = {
+      id: nanoid(),
+      plantCode: form.plantCode,
+      plantName: form.plantName,
+      srlNo,
+      size: form.size,
+      location: form.location,
+      warehouse: form.warehouse,
+      createdBy: this.auth?.name || 'Admin',
+      createdAt: today(),
+    };
+    this.write({ ...data, plantTags: [tag, ...data.plantTags] });
+    return tag;
+  }
+
+  async replaceOnhandItems(rows: Array<Omit<OnhandItem, 'id'>>): Promise<OnhandItem[]> {
+    const data = this.read();
+    const items: OnhandItem[] = rows.map(r => ({ id: nanoid(), ...r }));
+    this.write({ ...data, onhandItems: items });
+    return items;
+  }
+
+  async createOnhandItem(form: Omit<OnhandItem, 'id'>): Promise<OnhandItem> {
+    const data = this.read();
+    const item: OnhandItem = { id: nanoid(), ...form };
+    this.write({ ...data, onhandItems: [item, ...data.onhandItems] });
+    return item;
   }
 
   async createUserAccount(form: { username: string; password: string; role: 'admin' | 'garden' }): Promise<UserAccount> {
@@ -829,7 +976,10 @@ export class ApiStore implements DataStore {
       this.request<UserAccount[]>('/api/users'),
       this.request<NumberSettings>('/api/masters/number-settings'),
     ]);
-    return { gps, dns, customers, plants, locations, users, numberSettings, lpoSoMappings: [] };
+    return {
+      gps, customers, plants, locations, users, numberSettings, lpoSoMappings: [], reprintLogs: [], plantTags: [], onhandItems: [],
+      dns: dns.map(dn => ({ ...dn, attachments: dn.attachments || [] })),
+    };
   }
 
   async getNumberSettings(): Promise<NumberSettings> {
@@ -916,6 +1066,14 @@ export class ApiStore implements DataStore {
     return this.request(`/api/delivery-notes/${encodeURIComponent(dnNo)}/complete`, { method: 'POST' });
   }
 
+  async addDeliveryNoteAttachment(): Promise<DeliveryNote> {
+    throw new Error('Attachments are not yet available when connected to the shared database');
+  }
+
+  async removeDeliveryNoteAttachment(): Promise<DeliveryNote> {
+    throw new Error('Attachments are not yet available when connected to the shared database');
+  }
+
   async createCustomer(form: { customerName: string; party: 'EXT' | 'INT'; projects: string[] }): Promise<Customer> {
     return this.request('/api/masters/customers', { method: 'POST', body: JSON.stringify(form) });
   }
@@ -941,6 +1099,22 @@ export class ApiStore implements DataStore {
 
   async createLpoSoMapping(): Promise<LpoSoMapping> {
     throw new Error('LPO / SO mapping is not yet available when connected to the shared database');
+  }
+
+  async createReprintLog(): Promise<ReprintLog> {
+    throw new Error('Reprint log is not yet available when connected to the shared database');
+  }
+
+  async createPlantTag(): Promise<PlantTag> {
+    throw new Error('Tag Print is not yet available when connected to the shared database');
+  }
+
+  async replaceOnhandItems(): Promise<OnhandItem[]> {
+    throw new Error('Onhand is not yet available when connected to the shared database');
+  }
+
+  async createOnhandItem(): Promise<OnhandItem> {
+    throw new Error('Onhand is not yet available when connected to the shared database');
   }
 
   async createUserAccount(form: { username: string; password: string; role: 'admin' | 'garden' }): Promise<UserAccount> {
