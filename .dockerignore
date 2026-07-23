@@ -1,0 +1,14 @@
+node_modules
+.next
+.git
+.env
+.env.*
+*.log
+gatepass-backend
+drizzle
+ARCHITECTURE.md
+DEPLOY.md
+DEPLOY-AWS.md
+README.md
+**/*.md
+tsconfig.tsbuildinfo
